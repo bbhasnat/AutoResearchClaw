@@ -19,6 +19,10 @@ AHVS is a cyclic hypothesis-validation pipeline built on top of ARC (AutoResearc
 11. [Configuration Reference](#11-configuration-reference)
 12. [Directory Layout](#12-directory-layout)
 13. [Advanced Usage](#13-advanced-usage)
+    - [Model Selection Strategy](#model-selection-strategy)
+    - [Budget Planning for Experiments](#budget-planning-for-experiments)
+    - [Execution Modes](#execution-modes)
+    - [Prompt Engineering Tips](#prompt-engineering-tips)
 
 ---
 
@@ -98,7 +102,7 @@ Each hypothesis gets its own worktree under `<cycle_dir>/worktrees/<ID>/`. This 
 
 After all hypotheses run, AHVS identifies the best improvement and keeps its worktree. All other worktrees are cleaned up. The kept worktree path and all patch paths are recorded in `cycle_summary.json`.
 
-If the target path is not a git repository, worktree creation fails gracefully and AHVS falls back to sandbox-only execution with a warning.
+If the target path is not a git repository, worktree creation fails and the hypothesis is marked as an error. Pass `--allow-sandbox-only` to permit sandbox-only fallback for non-git targets (see [Execution modes](#execution-modes)).
 
 ---
 
@@ -293,11 +297,14 @@ researchclaw ahvs [options]
 | `--prompts` | none | Path to AHVS prompts override YAML |
 | `--model` | `claude-opus-4-6` | LLM model ID |
 | `--api-key-env` | `ANTHROPIC_API_KEY` | Env var holding the API key |
+| `--base-url` | *(per provider)* | Override LLM base URL (required for `openai-compatible`) |
 | `--provider` | `anthropic` | LLM provider: `anthropic`, `openai`, `openai-compatible`, `openrouter`, `deepseek`, `acp` |
 | `--acp-agent` | `claude` | ACP agent CLI name (only with `--provider acp`) |
 | `--acpx-command` | *(auto-detect)* | Path to acpx binary (only with `--provider acp`) |
 | `--acp-session-name` | `researchclaw-ahvs` | ACP session name (only with `--provider acp`) |
 | `--acp-timeout` | `1800` | ACP per-prompt timeout in seconds (only with `--provider acp`) |
+| `--allow-sandbox-only` | off | Allow sandbox-only fallback when worktree creation fails |
+| `--apply-best` | off | Auto-apply best improving hypothesis patch and update baseline |
 | `--run-dir` | `<repo>/.ahvs/cycles/<ts>` | Override cycle output directory |
 
 ### Resuming a failed cycle
@@ -330,28 +337,39 @@ researchclaw ahvs \
 
 ## 7. Hypothesis Types
 
-AHVS generates hypotheses of these types. Each type maps to the tools CodeAgent will invoke:
+AHVS generates hypotheses of these types. Each type controls what instructions, constraints, and package hints CodeAgent receives:
 
-| Type | CodeAgent uses | Required tools |
+| Type | Focus area | Required tools |
 |---|---|---|
-| `prompt_rewrite` | Promptfoo eval | `promptfoo` |
-| `model_comparison` | Promptfoo with multiple model configs | `promptfoo` |
-| `config_change` | Promptfoo eval on modified config | `promptfoo` |
-| `dspy_optimize` | DSPy compile → Promptfoo held-out eval | `dspy`, `promptfoo` |
-| `code_change` | Custom Python script + pytest | *(none — uses local sandbox)* |
-| `architecture_change` | New module + integration tests in sandbox | *(none — uses local sandbox)* |
-| `multi_llm_judge` | Build a judge chain, evaluate with it | *(none — uses local sandbox)* |
+| `prompt_rewrite` | System prompts, few-shot examples, instruction wording | `promptfoo` |
+| `model_comparison` | Swap model IDs, compare across providers | `promptfoo` |
+| `config_change` | Hyperparameters (temperature, chunk_size, top_k) | `promptfoo` |
+| `dspy_optimize` | DSPy modules for programmatic prompt optimization | `dspy`, `promptfoo` |
+| `code_change` | Algorithms, retrieval logic, ranking functions, data processing | *(none — uses local sandbox)* |
+| `architecture_change` | Pipeline redesign, new components, caching, re-rankers | *(none — uses local sandbox)* |
+| `multi_llm_judge` | Multi-model consensus or judge-based evaluation | *(none — uses local sandbox)* |
 | `phoenix_eval` | Arize Phoenix evaluation | `arize-phoenix` |
 
-AHVS runs a secondary pre-flight check *after* hypothesis selection (Stage 4) to verify the tools needed for selected hypothesis types are available. This check skips the LLM connectivity test (already verified at Stage 1) and focuses only on tool availability. If a tool is missing, AHVS warns and asks for confirmation before proceeding.
+### How types affect execution
 
-> **Note:** In the current implementation, all hypothesis types share the same execution path through CodeAgent. The type primarily influences which skills and package hints are injected into CodeAgent's context, and which tools are checked at pre-flight. CodeAgent decides the actual execution strategy based on these inputs.
+All hypothesis types share the same execution engine: **CodeAgent**. There is no separate executor per type. Instead, each type injects **type-specific execution strategies** (defined in `_TYPE_EXECUTION_STRATEGIES` in `executor.py`) that shape CodeAgent's behaviour:
+
+- **System instructions** — type-specific guidance appended to CodeAgent's system prompt (e.g., `code_change` is told to focus on algorithms and retrieval logic, not prompt wording)
+- **Constraints** — hard boundaries on what the type may modify (e.g., `prompt_rewrite` is scoped to prompt template files only)
+- **Success guidance** — how to measure whether the change achieved its goal
+- **Package hints** — which pip packages and tools to prefer
+
+This means the taxonomy controls *what CodeAgent is instructed to do*, not *which runtime engine runs*. A `code_change` hypothesis produces genuinely different code than a `prompt_rewrite` because CodeAgent receives different instructions, constraints, and success criteria — but both flow through the same `CodeAgent.generate()` call.
+
+### Pre-flight tool checks
+
+AHVS runs a secondary pre-flight check *after* hypothesis selection (Stage 4) to verify the tools needed for selected hypothesis types are available. This check skips the LLM connectivity test (already verified at Stage 1) and focuses only on tool availability. If a tool is missing, AHVS warns and asks for confirmation before proceeding.
 
 ---
 
 ## 8. Skill Library
 
-Skills are pre-built guidance templates injected into CodeAgent's prompt context. CodeAgent reads them, picks the right one, and references it in its implementation plan. Skills are **informational** — they tell CodeAgent what tools are available and how to use them, but AHVS does not enforce or dispatch skill invocations at runtime. The `skill_used` field in `HypothesisResult` reflects the plan's declared skill, not a runtime observation.
+Skills are pre-built guidance templates injected into CodeAgent's prompt context. CodeAgent reads them, picks the right one, and references it in its implementation plan. Skills are **informational** — they tell CodeAgent what tools are available and how to use them, but AHVS does not enforce or dispatch skill invocations at runtime. The `skill_planned` field in `HypothesisResult` reflects the plan's declared skill, not a runtime observation.
 
 ### Built-in skills
 
@@ -616,6 +634,7 @@ export OPENAI_API_KEY=sk-...
 researchclaw ahvs \
   --repo . \
   --question "..." \
+  --provider openai \
   --model gpt-4o \
   --api-key-env OPENAI_API_KEY
 ```
@@ -626,6 +645,7 @@ export OPENROUTER_API_KEY=...
 researchclaw ahvs \
   --repo . \
   --question "..." \
+  --provider openrouter \
   --model anthropic/claude-opus-4-6 \
   --api-key-env OPENROUTER_API_KEY
 ```
@@ -640,40 +660,92 @@ Every hypothesis has its own workspace under `tool_runs/<ID>/`. You can inspect:
 
 ### Keeping a successful hypothesis
 
-After reviewing `cycle_summary.json`, you can apply the best hypothesis from its kept worktree or patch file:
+**Automatic promotion (recommended):**
+
+Use `--apply-best` to let AHVS apply the winning patch and update the baseline in one step:
 
 ```bash
-# Option 1: Apply the patch directly
-git apply <cycle_dir>/tool_runs/H1/H1.patch
+researchclaw ahvs \
+  --repo . --question "..." \
+  --auto-approve --apply-best
+```
 
-# Option 2: Cherry-pick from the kept worktree (path in cycle_summary.json → kept_worktree)
-cd <kept_worktree_path>
-git diff --cached  # Review the changes
+When the cycle completes successfully and a hypothesis improved the metric, AHVS will:
+1. Run `git apply` with the best hypothesis patch on your working tree
+2. Update `.ahvs/baseline_metric.json` with the new metric value and commit SHA
+3. Print a confirmation of what was applied
+
+**Manual promotion:**
+
+If you prefer to review before applying, inspect `cycle_summary.json` and apply manually:
+
+```bash
+# Apply the patch
+git apply <cycle_dir>/tool_runs/H1/H1.patch
 ```
 
 The `cycle_summary.json` includes:
 - `kept_worktree`: path to the git worktree of the best hypothesis (if one improved)
 - `kept_patch`: path to its `.patch` file (relative to cycle_dir)
 - `all_patches`: list of `.patch` paths for every hypothesis (audit trail)
+- `per_hypothesis`: per-hypothesis details including `execution_mode` (`repo_grounded` or `sandbox_only`)
 - `all_unmeasured`: `true` if no hypothesis produced a valid measurement (cycle is invalid)
-- `hypotheses_measured`: count of hypotheses with successful metric extraction
 
-After applying the change, update the baseline:
+After manual application, update the baseline yourself or let `--apply-best` handle it on the next run.
 
-```json
-{
-  "primary_metric": "answer_relevance",
-  "answer_relevance": 0.79,
-  "recorded_at": "2026-03-18T14:00:00Z",
-  "commit": "new-commit-sha",
-  "eval_command": "promptfoo eval --config .ahvs/eval/baseline.yaml"
-}
-```
+### Execution modes
 
-Run the next cycle with the updated baseline. AHVS will treat the new value as the target to beat.
+By default, AHVS requires repo-grounded execution via git worktrees. If a worktree cannot be created (e.g. non-git target), the hypothesis **fails** rather than silently falling back to sandbox-only mode. This ensures cycle results are always comparable and reproducible.
+
+To permit sandbox-only fallback for non-git directories or single-file projects, pass `--allow-sandbox-only`. Results from sandbox-only execution are stamped with `execution_mode: "sandbox_only"` in `results.json` and `per_hypothesis` in `cycle_summary.json`.
+
+### Model selection strategy
+
+AHVS makes LLM calls at three points in the cycle, each with different quality requirements:
+
+| Call site | What it does | Model recommendation |
+|-----------|-------------|---------------------|
+| **Hypothesis generation** (Stage 3) | Proposes concrete, diverse improvement strategies | Use the **strongest reasoning model** available (e.g. `claude-opus-4-6`, `o3`). This is the highest-leverage call — a weak model here produces shallow, repetitive hypotheses that waste the entire cycle budget. |
+| **Validation planning** (Stage 5) | Writes implementation steps and eval criteria | Same strong model. The plan quality directly determines whether CodeAgent produces useful code. |
+| **CodeAgent execution** (Stage 6) | Generates and runs implementation code | Strong model again. This is where real code is written — algorithms, retrieval pipelines, evaluation harnesses. A capable coding model produces implementations that actually test the hypothesis rather than trivial wrappers. |
+| **Report writing** (Stage 7) | Summarizes results and extracts lessons | A lighter model is acceptable here (e.g. `claude-sonnet-4-6`, `gpt-4o-mini`) since it only summarizes data that already exists. |
+
+**The general principle:** Invest in intelligence where it has multiplicative impact — hypothesis quality and code quality compound across cycles. A single good hypothesis from a strong model is worth more than five shallow ones from a cheap model.
+
+### Budget planning for experiments
+
+Before running AHVS cycles, estimate your costs:
+
+**Per-cycle cost breakdown (typical):**
+
+| Component | Token usage | Notes |
+|-----------|------------|-------|
+| Hypothesis generation | ~2K input + ~2K output | One LLM call |
+| Validation planning | ~3K input + ~2.5K output | One LLM call |
+| CodeAgent execution | ~10–50K per hypothesis | Depends on complexity; `code_change` and `architecture_change` types use more tokens than `prompt_rewrite` |
+| Report writing | ~3K input + ~1.5K output | One LLM call |
+| **Total per cycle** | **~20–70K tokens** (with 2–3 hypotheses) | |
+
+**Cost control levers:**
+
+- `--max-hypotheses 1–2` for exploratory cycles; save `3–5` for when you have high-confidence directions
+- Start with `prompt_rewrite` and `config_change` hypotheses (cheaper, faster) before moving to `code_change` and `architecture_change` (more tokens, longer sandbox runs)
+- Use `--auto-approve` carefully — unattended cycles with 5 hypotheses can accumulate cost without human judgment on which ideas are worth testing
+- Set up a regression guard early — it prevents wasted cycles on regressions before you inspect results
+
+**Planning a multi-cycle experiment:**
+
+| Phase | Cycles | Strategy |
+|-------|--------|----------|
+| **Exploration** (1–3 cycles) | 1–2 hypotheses per cycle | Cast a wide net: mix `prompt_rewrite`, `config_change`, `code_change`. Learn which levers move the metric. |
+| **Exploitation** (3–5 cycles) | 2–3 hypotheses per cycle | Double down on the type that showed movement. Use prior lessons to refine. |
+| **Diminishing returns** | Stop when delta < noise floor | If 2–3 consecutive cycles show no improvement, the metric may be saturated for this approach. Change the question or target a different metric. |
+
+A typical improvement campaign runs 5–10 cycles. Budget accordingly — with a strong model at ~$15/M input tokens, a 5-cycle campaign with 3 hypotheses each costs roughly $5–15 in API calls.
 
 ### Prompt engineering tips
 
 - Keep `--question` specific and metric-anchored: *"Improve answer\_relevance from 0.74 to above 0.78 by improving the retrieval step"* generates better hypotheses than *"make the system better"*.
 - Use `--max-hypotheses 2` for faster cycles during exploration; increase to 5 when you want broader coverage.
 - The `--auto-approve` flag is safe for unattended runs but be sure your regression guard is set up — it prevents a bad hypothesis from being silently "improved".
+- Reference concrete code paths in your question when possible: *"The chunking in `src/pipeline/splitter.py` uses fixed 512-token windows — can we improve answer\_relevance by switching to semantic chunking?"* gives CodeAgent much better starting context.

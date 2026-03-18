@@ -28,12 +28,13 @@ class HypothesisResult:
     artifact_paths: list[str] = field(default_factory=list)  # paths relative to cycle_dir
     raw_output_path: str = ""   # full eval output directory for audit
     duration_seconds: float = 0.0
-    skill_used: str | None = None  # skill name CodeAgent invoked
+    skill_planned: str | None = None  # skill name from validation plan (plan-time, not runtime)
     error: str | None = None    # None on success
     measurement_status: str = "not_executed"  # "measured" | "extraction_failed" | "sandbox_error" | "not_executed"
     kept: bool = False          # set by operator after reviewing cycle_summary
     worktree_path: str = ""     # path to kept worktree (empty if cleaned up)
     patch_path: str = ""        # path to .patch file relative to cycle_dir
+    execution_mode: str = "repo_grounded"  # "repo_grounded" | "sandbox_only"
 
     @classmethod
     def make_error(
@@ -82,4 +83,8 @@ def save_results(results: list[HypothesisResult], path: Path) -> None:
 
 def load_results(path: Path) -> list[HypothesisResult]:
     data = json.loads(path.read_text(encoding="utf-8"))
+    for item in data:
+        # Migrate old skill_used → skill_planned (v4 rename)
+        if "skill_used" in item and "skill_planned" not in item:
+            item["skill_planned"] = item.pop("skill_used")
     return [HypothesisResult(**item) for item in data]

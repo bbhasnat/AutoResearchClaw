@@ -1317,3 +1317,590 @@ class TestMakeLlmClientUsesFactory:
         client = _make_llm_client(config)
         assert isinstance(client, ACPClient)
         assert client.config.agent == "claude"
+
+
+# ---------------------------------------------------------------------------
+# 11. v4 review fixes — unified preflight, provider matrix, CLI --base-url,
+#     from_cli_args parity
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightUsesSharedFactory:
+    """Fix #1 (v4): check_llm_connectivity routes through create_llm_client."""
+
+    def test_preflight_builds_shim_for_openai(self) -> None:
+        """provider=openai should build a shim that the factory accepts."""
+        from researchclaw.ahvs.health import _build_preflight_shim
+
+        shim = _build_preflight_shim(
+            api_key="sk-test", model="gpt-4o", base_url="",
+            provider="openai", ahvs_config=None,
+        )
+        assert shim.llm.provider == "openai"
+        assert shim.llm.primary_model == "gpt-4o"
+        assert shim.llm.api_key == "sk-test"
+        assert shim.metaclaw_bridge is None
+
+    def test_preflight_builds_shim_for_openrouter(self) -> None:
+        """provider=openrouter should build a shim that the factory accepts."""
+        from researchclaw.ahvs.health import _build_preflight_shim
+
+        shim = _build_preflight_shim(
+            api_key="sk-or-test", model="anthropic/claude-opus-4-6",
+            base_url="", provider="openrouter", ahvs_config=None,
+        )
+        assert shim.llm.provider == "openrouter"
+        assert shim.llm.primary_model == "anthropic/claude-opus-4-6"
+        assert shim.llm.api_key == "sk-or-test"
+
+    def test_preflight_shim_from_ahvs_config(self, tmp_path: Path) -> None:
+        """When ahvs_config is provided, shim reads from it."""
+        from researchclaw.ahvs.health import _build_preflight_shim
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="openai",
+            llm_base_url="https://custom.example.com/v1",
+            llm_model="gpt-4o",
+            llm_api_key="sk-from-config",
+        )
+        shim = _build_preflight_shim(
+            api_key="sk-ignored", model="ignored", base_url="ignored",
+            provider="ignored", ahvs_config=config,
+        )
+        # ahvs_config fields should take priority
+        assert shim.llm.provider == "openai"
+        assert shim.llm.base_url == "https://custom.example.com/v1"
+        assert shim.llm.api_key == "sk-from-config"
+        assert shim.llm.primary_model == "gpt-4o"
+
+    def test_preflight_empty_key_still_fast_fails(self) -> None:
+        """Non-ACP provider with empty key should fail with 'No API key'."""
+        from researchclaw.ahvs.health import check_llm_connectivity
+
+        result = check_llm_connectivity(
+            api_key="", model="gpt-4o", provider="openai",
+        )
+        assert result.status == "fail"
+        assert "No API key" in result.detail
+
+
+class TestProviderMatrixFactory:
+    """Fix #5 (v4): verify the factory produces correct clients for openai/openrouter."""
+
+    def test_openai_provider_returns_llm_client(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.executor import _make_llm_client
+        from researchclaw.llm.client import LLMClient
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="openai",
+            llm_api_key="sk-test",
+            llm_model="gpt-4o",
+        )
+        client = _make_llm_client(config)
+        assert isinstance(client, LLMClient)
+        # Should use the OpenAI preset base_url
+        assert "openai.com" in client.config.base_url
+
+    def test_openrouter_provider_returns_llm_client(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.executor import _make_llm_client
+        from researchclaw.llm.client import LLMClient
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="openrouter",
+            llm_api_key="sk-or-test",
+            llm_model="anthropic/claude-opus-4-6",
+        )
+        client = _make_llm_client(config)
+        assert isinstance(client, LLMClient)
+        assert "openrouter.ai" in client.config.base_url
+
+    def test_openai_shim_base_url_empty_uses_preset(self, tmp_path: Path) -> None:
+        """When llm_base_url is empty, the factory should use PROVIDER_PRESETS."""
+        from researchclaw.ahvs.executor import _ahvs_config_to_rc_shim
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="openai",
+            llm_base_url="",  # empty — factory should use preset
+            llm_api_key="sk-test",
+        )
+        shim = _ahvs_config_to_rc_shim(config)
+        assert shim.llm.provider == "openai"
+        assert shim.llm.base_url == ""  # shim passes empty; factory resolves via preset
+
+    def test_openrouter_explicit_base_url_preserved(self, tmp_path: Path) -> None:
+        """Explicit base_url overrides the preset."""
+        from researchclaw.ahvs.executor import _make_llm_client
+        from researchclaw.llm.client import LLMClient
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="openrouter",
+            llm_base_url="https://custom-proxy.example.com/v1",
+            llm_api_key="sk-test",
+        )
+        client = _make_llm_client(config)
+        assert isinstance(client, LLMClient)
+        assert client.config.base_url == "https://custom-proxy.example.com/v1"
+
+
+class TestProviderMatrixPreflight:
+    """Fix #5 (v4): preflight works for openai/openrouter providers."""
+
+    def test_openai_preflight_uses_factory(self) -> None:
+        """provider=openai with a fake key should fail via the shared factory, not 'No API key'."""
+        from researchclaw.ahvs.health import check_llm_connectivity
+
+        result = check_llm_connectivity(
+            api_key="sk-fake-openai-key", model="gpt-4o",
+            provider="openai",
+        )
+        assert result.status == "fail"
+        # Should have attempted a real call (not early-out on "No API key")
+        assert "No API key" not in result.detail
+
+    def test_openrouter_preflight_uses_factory(self) -> None:
+        """provider=openrouter with a fake key should fail via the shared factory."""
+        from researchclaw.ahvs.health import check_llm_connectivity
+
+        result = check_llm_connectivity(
+            api_key="sk-fake-or-key",
+            model="anthropic/claude-opus-4-6",
+            provider="openrouter",
+        )
+        assert result.status == "fail"
+        assert "No API key" not in result.detail
+
+
+class TestCLIBaseUrl:
+    """Fix #2 (v4): --base-url is wired through CLI to AHVSConfig."""
+
+    def test_base_url_parsed(self) -> None:
+        from researchclaw.cli import main
+        import argparse
+
+        # Parse args without executing
+        from researchclaw.cli import argparse as _ap
+        parser = _ap.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        ahvs_p = sub.add_parser("ahvs")
+        ahvs_p.add_argument("--repo", "-r", required=True)
+        ahvs_p.add_argument("--question", "-q", required=True)
+        ahvs_p.add_argument("--base-url", default="")
+        ahvs_p.add_argument("--provider", default="anthropic")
+
+        args = parser.parse_args([
+            "ahvs", "--repo", "/tmp/test", "--question", "test",
+            "--base-url", "https://custom.example.com/v1",
+            "--provider", "openai-compatible",
+        ])
+        assert args.base_url == "https://custom.example.com/v1"
+        assert args.provider == "openai-compatible"
+
+    def test_base_url_wired_to_config(self, tmp_path: Path) -> None:
+        """AHVSConfig receives llm_base_url from CLI --base-url."""
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="openai-compatible",
+            llm_base_url="https://my-proxy.example.com/v1",
+            llm_api_key="sk-test",
+        )
+        assert config.llm_base_url == "https://my-proxy.example.com/v1"
+
+
+class TestFromCliArgsParity:
+    """Fix #4 (v4): from_cli_args uses the correct CLI attribute names."""
+
+    def test_from_cli_args_reads_correct_attrs(self, tmp_path: Path) -> None:
+        """from_cli_args should read args.model (not args.llm_model), etc."""
+        import argparse
+
+        args = argparse.Namespace(
+            repo=str(tmp_path),
+            question="test?",
+            run_dir=None,
+            max_hypotheses=2,
+            regression_guard=None,
+            skill_registry=None,
+            prompts=None,
+            provider="openai",
+            base_url="https://api.openai.com/v1",
+            model="gpt-4o",
+            api_key_env="OPENAI_API_KEY",
+            acp_agent="claude",
+            acpx_command="",
+            acp_session_name="researchclaw-ahvs",
+            acp_timeout_sec=1800,
+        )
+        config = AHVSConfig.from_cli_args(args)
+        assert config.llm_provider == "openai"
+        assert config.llm_base_url == "https://api.openai.com/v1"
+        assert config.llm_model == "gpt-4o"
+        assert config.llm_api_key_env == "OPENAI_API_KEY"
+        assert config.max_hypotheses == 2
+
+    def test_from_cli_args_defaults(self, tmp_path: Path) -> None:
+        """from_cli_args should handle missing optional attrs gracefully."""
+        import argparse
+
+        args = argparse.Namespace(
+            repo=str(tmp_path),
+            question="test?",
+        )
+        config = AHVSConfig.from_cli_args(args)
+        assert config.llm_provider == "anthropic"
+        assert config.llm_model == "claude-opus-4-6"
+        assert config.llm_api_key_env == "ANTHROPIC_API_KEY"
+        assert config.llm_base_url == ""
+
+
+# ---------------------------------------------------------------------------
+# 12. v4 review fixes (round 2) — fail-closed worktree, type strategies,
+#     apply-best, skill_planned rename
+# ---------------------------------------------------------------------------
+
+
+class TestSkillPlannedRename:
+    """Finding 4: skill_used → skill_planned."""
+
+    def test_skill_planned_field_exists(self) -> None:
+        r = _make_result()
+        assert hasattr(r, "skill_planned")
+        assert not hasattr(r, "skill_used")
+        assert r.skill_planned is None
+
+    def test_skill_planned_set(self) -> None:
+        r = _make_result(skill_planned="promptfoo_eval")
+        assert r.skill_planned == "promptfoo_eval"
+
+    def test_load_results_migrates_skill_used(self, tmp_path: Path) -> None:
+        """Old results.json with skill_used should be migrated to skill_planned."""
+        from researchclaw.ahvs.result import load_results, save_results
+
+        results = [_make_result(skill_planned="sandbox_run")]
+        path = tmp_path / "results.json"
+        save_results(results, path)
+
+        # Manually rewrite to use old field name
+        import json
+        data = json.loads(path.read_text())
+        for item in data:
+            item["skill_used"] = item.pop("skill_planned")
+        path.write_text(json.dumps(data))
+
+        loaded = load_results(path)
+        assert loaded[0].skill_planned == "sandbox_run"
+
+
+class TestExecutionModeField:
+    """Finding 1: execution_mode field on HypothesisResult."""
+
+    def test_default_is_repo_grounded(self) -> None:
+        r = _make_result()
+        assert r.execution_mode == "repo_grounded"
+
+    def test_sandbox_only(self) -> None:
+        r = _make_result(execution_mode="sandbox_only")
+        assert r.execution_mode == "sandbox_only"
+
+    def test_make_error_default_mode(self) -> None:
+        r = HypothesisResult.make_error(
+            hypothesis_id="H1",
+            hypothesis_type="code_change",
+            primary_metric="f1",
+            baseline_value=0.5,
+            error="worktree failed",
+        )
+        assert r.execution_mode == "repo_grounded"
+
+
+class TestWorktreeFailClosed:
+    """Finding 1: worktree failure should fail hypothesis by default."""
+
+    def test_allow_sandbox_only_default_false(self, tmp_path: Path) -> None:
+        config = AHVSConfig(repo_path=tmp_path, question="test")
+        assert config.allow_sandbox_only is False
+
+    def test_allow_sandbox_only_set_true(self, tmp_path: Path) -> None:
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test", allow_sandbox_only=True
+        )
+        assert config.allow_sandbox_only is True
+
+    def test_cycle_summary_has_per_hypothesis(self, tmp_path: Path) -> None:
+        """cycle_summary.json should include per_hypothesis with execution_mode."""
+        from researchclaw.ahvs.skills import SkillLibrary
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        cycle_dir = tmp_path / "cycle_001"
+        cycle_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create minimal cycle artifacts
+        baseline = {
+            "primary_metric": "answer_relevance",
+            "value": 0.74,
+            "eval_command": "echo test",
+        }
+        bundle = {"baseline": baseline, "lessons": [], "rejected": []}
+        (cycle_dir / "context_bundle.json").write_text(json.dumps(bundle))
+        (cycle_dir / "cycle_manifest.json").write_text(json.dumps({"cycle_id": "test"}))
+        (cycle_dir / "hypotheses.md").write_text("# H1\n")
+        (cycle_dir / "selection.md").write_text("H1")
+        (cycle_dir / "selection.json").write_text(
+            json.dumps({"selected": ["H1"], "rationale": "test"})
+        )
+        (cycle_dir / "validation_plan.md").write_text("# Plan\n")
+        results = [_make_result(hypothesis_id="H1")]
+        save_results(results, cycle_dir / "results.json")
+        (cycle_dir / "report.md").write_text("# Report\n")
+        (cycle_dir / "friction_log.md").write_text("# Friction\n")
+
+        config = AHVSConfig(repo_path=repo, question="test?", run_dir=cycle_dir)
+        skill_lib = SkillLibrary()
+
+        result = execute_ahvs_stage(
+            AHVSStage.AHVS_CYCLE_VERIFY,
+            cycle_dir=cycle_dir,
+            config=config,
+            skill_library=skill_lib,
+            auto_approve=True,
+        )
+
+        assert result.status == StageStatus.DONE
+        summary = json.loads((cycle_dir / "cycle_summary.json").read_text())
+        assert "per_hypothesis" in summary
+        assert len(summary["per_hypothesis"]) == 1
+        assert summary["per_hypothesis"][0]["execution_mode"] == "repo_grounded"
+
+
+class TestTypeExecutionStrategies:
+    """Finding 2: all hypothesis types must have execution strategies."""
+
+    def test_all_types_have_strategies(self) -> None:
+        from researchclaw.ahvs.executor import _TYPE_EXECUTION_STRATEGIES
+
+        expected_types = {
+            "prompt_rewrite", "model_comparison", "config_change",
+            "dspy_optimize", "code_change", "architecture_change",
+            "multi_llm_judge",
+        }
+        assert set(_TYPE_EXECUTION_STRATEGIES.keys()) == expected_types
+
+    def test_strategy_has_required_keys(self) -> None:
+        from researchclaw.ahvs.executor import _TYPE_EXECUTION_STRATEGIES
+
+        for hyp_type, strategy in _TYPE_EXECUTION_STRATEGIES.items():
+            assert "system_addition" in strategy, f"{hyp_type} missing system_addition"
+            assert "constraints" in strategy, f"{hyp_type} missing constraints"
+            assert "success_guidance" in strategy, f"{hyp_type} missing success_guidance"
+
+    def test_code_change_emphasizes_algorithms(self) -> None:
+        from researchclaw.ahvs.executor import _TYPE_EXECUTION_STRATEGIES
+
+        strat = _TYPE_EXECUTION_STRATEGIES["code_change"]
+        assert "algorithm" in strat["system_addition"].lower()
+        assert "code logic" in strat["constraints"].lower()
+
+    def test_architecture_change_emphasizes_new_modules(self) -> None:
+        from researchclaw.ahvs.executor import _TYPE_EXECUTION_STRATEGIES
+
+        strat = _TYPE_EXECUTION_STRATEGIES["architecture_change"]
+        assert "new module" in strat["system_addition"].lower() or "NEW module" in strat["system_addition"]
+
+    def test_prompt_rewrite_excludes_code(self) -> None:
+        from researchclaw.ahvs.executor import _TYPE_EXECUTION_STRATEGIES
+
+        strat = _TYPE_EXECUTION_STRATEGIES["prompt_rewrite"]
+        assert "DO NOT modify" in strat["system_addition"]
+
+
+class TestHypothesisGenPromptDiversity:
+    """Finding 2: generation prompt should guide toward diverse hypothesis types."""
+
+    def test_prompt_includes_type_guidance(self) -> None:
+        from researchclaw.ahvs.prompts import _AHVS_STAGES
+
+        user_prompt = _AHVS_STAGES["ahvs_hypothesis_gen"]["user"]
+        assert "Type guidance:" in user_prompt
+        assert "code_change:" in user_prompt
+        assert "architecture_change:" in user_prompt
+
+    def test_prompt_encourages_diversity(self) -> None:
+        from researchclaw.ahvs.prompts import _AHVS_STAGES
+
+        user_prompt = _AHVS_STAGES["ahvs_hypothesis_gen"]["user"]
+        assert "diverse types" in user_prompt.lower()
+
+    def test_prompt_discourages_prompt_only(self) -> None:
+        from researchclaw.ahvs.prompts import _AHVS_STAGES
+
+        user_prompt = _AHVS_STAGES["ahvs_hypothesis_gen"]["user"]
+        assert "not just" in user_prompt.lower() or "NEW algorithms" in user_prompt
+
+
+class TestApplyBestConfig:
+    """Finding 3: --apply-best config fields."""
+
+    def test_apply_best_default_false(self, tmp_path: Path) -> None:
+        config = AHVSConfig(repo_path=tmp_path, question="test")
+        assert config.apply_best is False
+
+    def test_apply_best_set_true(self, tmp_path: Path) -> None:
+        config = AHVSConfig(repo_path=tmp_path, question="test", apply_best=True)
+        assert config.apply_best is True
+
+    def test_from_cli_args_apply_best(self, tmp_path: Path) -> None:
+        import argparse
+
+        args = argparse.Namespace(
+            repo=str(tmp_path), question="test?",
+            allow_sandbox_only=True, apply_best=True,
+        )
+        config = AHVSConfig.from_cli_args(args)
+        assert config.allow_sandbox_only is True
+        assert config.apply_best is True
+
+
+class TestApplyBestFunction:
+    """Finding 3: _apply_best reads cycle_summary and applies patch."""
+
+    def test_no_best_hypothesis_returns_zero(self, tmp_path: Path) -> None:
+        from researchclaw.cli import _apply_best
+
+        cycle_dir = tmp_path / "cycle"
+        cycle_dir.mkdir()
+        summary = {"best_hypothesis": None, "recommendation": "no improvement"}
+        (cycle_dir / "cycle_summary.json").write_text(json.dumps(summary))
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test", run_dir=cycle_dir
+        )
+        assert _apply_best(config) == 0
+
+    def test_missing_summary_returns_one(self, tmp_path: Path) -> None:
+        from researchclaw.cli import _apply_best
+
+        cycle_dir = tmp_path / "empty_cycle"
+        cycle_dir.mkdir()
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test", run_dir=cycle_dir
+        )
+        assert _apply_best(config) == 1
+
+    def test_missing_patch_returns_one(self, tmp_path: Path) -> None:
+        from researchclaw.cli import _apply_best
+
+        cycle_dir = tmp_path / "cycle"
+        cycle_dir.mkdir()
+        summary = {
+            "best_hypothesis": "H1",
+            "kept_patch": "tool_runs/H1/H1.patch",
+            "best_metric_value": 0.85,
+        }
+        (cycle_dir / "cycle_summary.json").write_text(json.dumps(summary))
+        # Don't create the patch file
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test", run_dir=cycle_dir
+        )
+        assert _apply_best(config) == 1
+
+    def test_no_patch_field_returns_one(self, tmp_path: Path) -> None:
+        from researchclaw.cli import _apply_best
+
+        cycle_dir = tmp_path / "cycle"
+        cycle_dir.mkdir()
+        summary = {
+            "best_hypothesis": "H1",
+            "kept_patch": None,  # sandbox-only, no patch
+        }
+        (cycle_dir / "cycle_summary.json").write_text(json.dumps(summary))
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test", run_dir=cycle_dir
+        )
+        assert _apply_best(config) == 1
+
+    def test_apply_best_e2e_success(self, tmp_path: Path) -> None:
+        """v5 Finding 4: e2e test — git apply + baseline update on a real repo."""
+        import subprocess
+
+        from researchclaw.cli import _apply_best
+
+        # 1. Create a real git repo with an initial file
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "hello.py").write_text("print('hello')\n")
+        subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+
+        # 2. Create a valid patch (add a new file)
+        cycle_dir = tmp_path / "cycle_001"
+        cycle_dir.mkdir()
+        patch_dir = cycle_dir / "tool_runs" / "H1"
+        patch_dir.mkdir(parents=True)
+        patch_content = (
+            "diff --git a/new_module.py b/new_module.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/new_module.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+# Improved retrieval\n"
+            "+def better_search(): pass\n"
+        )
+        (patch_dir / "H1.patch").write_text(patch_content)
+
+        # 3. Create cycle_summary.json with a best hypothesis
+        summary = {
+            "best_hypothesis": "H1",
+            "kept_patch": "tool_runs/H1/H1.patch",
+            "best_metric_value": 0.92,
+        }
+        (cycle_dir / "cycle_summary.json").write_text(json.dumps(summary))
+
+        # 4. Create baseline_metric.json
+        baseline_path = repo / ".ahvs" / "baseline_metric.json"
+        baseline_path.parent.mkdir(parents=True)
+        baseline = {
+            "primary_metric": "answer_relevance",
+            "answer_relevance": 0.80,
+        }
+        baseline_path.write_text(json.dumps(baseline, indent=2))
+
+        # 5. Run _apply_best
+        config = AHVSConfig(
+            repo_path=repo,
+            question="test",
+            run_dir=cycle_dir,
+        )
+        result = _apply_best(config)
+
+        # 6. Verify patch was applied
+        assert result == 0
+        new_file = repo / "new_module.py"
+        assert new_file.exists(), "Patch should have created new_module.py"
+        assert "better_search" in new_file.read_text()
+
+        # 7. Verify baseline was updated
+        updated = json.loads(baseline_path.read_text())
+        assert updated["answer_relevance"] == 0.92
+        assert updated["applied_from_cycle"] == "cycle_001"
+        assert updated["applied_hypothesis"] == "H1"
+        assert "recorded_at" in updated
+        assert "commit" in updated  # git rev-parse HEAD should succeed

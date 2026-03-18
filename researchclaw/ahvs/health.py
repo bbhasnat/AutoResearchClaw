@@ -248,110 +248,121 @@ def check_llm_connectivity(
 ) -> CheckResult:
     """Lightweight LLM ping — verify connectivity before the cycle starts.
 
-    When *provider* is ``"acp"``, uses ``ACPClient.preflight()`` instead
-    of sending a real chat completion — no API key required.
+    Routes through the **same** shared ``create_llm_client()`` factory that
+    the runtime path uses, so every provider (anthropic, openai, openrouter,
+    acp, …) is validated identically at preflight and at execution time.
 
-    *ahvs_config* is an optional ``AHVSConfig`` instance used only in ACP
-    mode to construct the client via the shared factory shim.
+    *ahvs_config* is an ``AHVSConfig`` instance (or None).  When provided
+    the factory shim is built from it; otherwise a minimal shim is
+    constructed from the individual arguments for backward compatibility.
     """
-    # ── ACP path: verify acpx + agent binary, no API key needed ──────
-    if provider == "acp":
-        return _check_llm_acp(ahvs_config)
+    effective_provider = provider or (
+        getattr(ahvs_config, "llm_provider", "anthropic") if ahvs_config else "anthropic"
+    )
 
-    # ── API-key path (original behaviour) ────────────────────────────
-    if not api_key:
+    # Fast-fail: non-ACP providers require an API key.
+    if effective_provider != "acp" and not api_key:
         return CheckResult(
             name="ahvs_llm_connectivity",
             status="fail",
             detail="No API key configured (checked env var and config)",
             fix="Set the API key env var (e.g. ANTHROPIC_API_KEY) or pass --api-key-env",
         )
+
     try:
-        from researchclaw.llm.client import LLMClient, LLMConfig
+        from researchclaw.llm import create_llm_client
 
-        llm_cfg = LLMConfig(
-            base_url=base_url or "https://api.anthropic.com/v1",
-            api_key=api_key,
-            primary_model=model,
+        shim = _build_preflight_shim(
+            api_key=api_key, model=model, base_url=base_url,
+            provider=provider, ahvs_config=ahvs_config,
         )
-        client = LLMClient(llm_cfg)
-
-        # Use the Anthropic adapter for Claude models
-        if any(p in model.lower() for p in ("claude", "anthropic")):
-            try:
-                from researchclaw.llm.anthropic_adapter import AnthropicAdapter
-
-                client._anthropic = AnthropicAdapter(  # type: ignore[attr-defined]
-                    api_key=api_key,
-                    model=model,
-                )
-            except (ImportError, Exception):  # noqa: BLE001
-                pass
-
-        response = client.chat(
-            [{"role": "user", "content": "Reply with OK"}],
-            max_tokens=10,
-        )
-        if response and response.content:
+        client = create_llm_client(shim)
+        ok, detail = client.preflight()
+        if ok:
             return CheckResult(
                 name="ahvs_llm_connectivity",
                 status="pass",
-                detail=f"LLM reachable (model={model})",
+                detail=f"LLM reachable ({detail})",
             )
         return CheckResult(
             name="ahvs_llm_connectivity",
             status="fail",
-            detail="LLM returned empty response",
-            fix="Check your API key and model name",
+            detail=f"LLM connectivity failed: {detail}",
+            fix="Check your API key, model name, and network connectivity",
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("LLM connectivity check failed: %s", exc)
         return CheckResult(
             name="ahvs_llm_connectivity",
             status="fail",
-            detail=f"LLM connectivity failed: {exc}",
+            detail=f"LLM connectivity check failed: {exc}",
             fix="Check your API key, model name, and network connectivity",
         )
 
 
-def _check_llm_acp(ahvs_config: object | None) -> CheckResult:
-    """ACP-specific preflight: verify acpx binary and agent CLI are available."""
-    try:
-        from researchclaw.llm.acp_client import ACPClient, ACPConfig
+# -- Preflight shim helpers ------------------------------------------------
 
-        if ahvs_config is not None:
-            acp_cfg = ACPConfig(
-                agent=getattr(ahvs_config, "acp_agent", "claude"),
-                cwd=getattr(ahvs_config, "acp_cwd", "."),
-                acpx_command=getattr(ahvs_config, "acpx_command", ""),
-                session_name=getattr(ahvs_config, "acp_session_name", "researchclaw-ahvs"),
-                timeout_sec=getattr(ahvs_config, "acp_timeout_sec", 1800),
-            )
-        else:
-            acp_cfg = ACPConfig()
+class _PreflightAcpShim:
+    """Minimal ACP config shim for preflight."""
+    __slots__ = ("agent", "cwd", "acpx_command", "session_name", "timeout_sec")
 
-        client = ACPClient(acp_cfg)
-        ok, detail = client.preflight()
-        if ok:
-            return CheckResult(
-                name="ahvs_llm_connectivity",
-                status="pass",
-                detail=f"ACP agent ready: {detail}",
-            )
-        return CheckResult(
-            name="ahvs_llm_connectivity",
-            status="fail",
-            detail=f"ACP preflight failed: {detail}",
-            fix="Install acpx (npm install -g acpx) and ensure the agent CLI is on PATH",
+    def __init__(self, ahvs_config: object | None) -> None:
+        self.agent = getattr(ahvs_config, "acp_agent", "claude") if ahvs_config else "claude"
+        self.cwd = getattr(ahvs_config, "acp_cwd", ".") if ahvs_config else "."
+        self.acpx_command = getattr(ahvs_config, "acpx_command", "") if ahvs_config else ""
+        self.session_name = getattr(ahvs_config, "acp_session_name", "researchclaw-ahvs") if ahvs_config else "researchclaw-ahvs"
+        self.timeout_sec = getattr(ahvs_config, "acp_timeout_sec", 1800) if ahvs_config else 1800
+
+
+class _PreflightLlmShim:
+    """Minimal LLM config shim for preflight."""
+    __slots__ = ("provider", "base_url", "api_key", "api_key_env",
+                 "primary_model", "fallback_models", "acp")
+
+    def __init__(self, *, api_key: str, model: str, base_url: str,
+                 provider: str, ahvs_config: object | None) -> None:
+        self.provider = provider or "anthropic"
+        self.base_url = base_url
+        self.api_key = api_key
+        self.api_key_env = ""  # already resolved
+        self.primary_model = model
+        self.fallback_models: tuple[str, ...] = ()
+        self.acp = _PreflightAcpShim(ahvs_config)
+
+
+class _PreflightConfigShim:
+    """Minimal RCConfig-shaped shim for ``create_llm_client``."""
+    __slots__ = ("llm", "metaclaw_bridge")
+
+    def __init__(self, llm_shim: _PreflightLlmShim) -> None:
+        self.llm = llm_shim
+        self.metaclaw_bridge = None
+
+
+def _build_preflight_shim(
+    *, api_key: str, model: str, base_url: str,
+    provider: str, ahvs_config: object | None,
+) -> _PreflightConfigShim:
+    """Build a shim from either an AHVSConfig or raw arguments.
+
+    If *ahvs_config* is provided its fields take priority (the executor
+    shim in ``executor.py`` is the authoritative shape; this mirrors it
+    for the preflight-only path).
+    """
+    if ahvs_config is not None:
+        llm = _PreflightLlmShim(
+            api_key=getattr(ahvs_config, "llm_api_key", api_key),
+            model=getattr(ahvs_config, "llm_model", model),
+            base_url=getattr(ahvs_config, "llm_base_url", base_url),
+            provider=getattr(ahvs_config, "llm_provider", provider),
+            ahvs_config=ahvs_config,
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("ACP connectivity check failed: %s", exc)
-        return CheckResult(
-            name="ahvs_llm_connectivity",
-            status="fail",
-            detail=f"ACP connectivity check failed: {exc}",
-            fix="Install acpx (npm install -g acpx) and ensure the agent CLI is on PATH",
+    else:
+        llm = _PreflightLlmShim(
+            api_key=api_key, model=model, base_url=base_url,
+            provider=provider, ahvs_config=None,
         )
+    return _PreflightConfigShim(llm)
 
 
 def run_ahvs_preflight(

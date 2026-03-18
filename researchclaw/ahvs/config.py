@@ -28,6 +28,8 @@ class AHVSConfig:
 
     # ── Guards ────────────────────────────────────────────────────────────
     regression_guard_path: Path | None = None
+    allow_sandbox_only: bool = False  # permit sandbox-only fallback on worktree failure
+    apply_best: bool = False          # auto-apply best hypothesis patch after cycle
 
     # ── Skill system ──────────────────────────────────────────────────────
     skill_registry_path: Path | None = None  # custom skills YAML
@@ -98,9 +100,12 @@ class AHVSConfig:
                 if getattr(args, "prompts", None)
                 else None
             ),
+            allow_sandbox_only=getattr(args, "allow_sandbox_only", False),
+            apply_best=getattr(args, "apply_best", False),
             llm_provider=getattr(args, "provider", "anthropic") or "anthropic",
-            llm_model=getattr(args, "llm_model", "claude-sonnet-4-6"),
-            llm_api_key_env=getattr(args, "llm_api_key_env", "ANTHROPIC_API_KEY"),
+            llm_base_url=getattr(args, "base_url", "") or "",
+            llm_model=getattr(args, "model", "claude-opus-4-6") or "claude-opus-4-6",
+            llm_api_key_env=getattr(args, "api_key_env", "ANTHROPIC_API_KEY") or "ANTHROPIC_API_KEY",
             acp_agent=getattr(args, "acp_agent", "claude") or "claude",
             acpx_command=getattr(args, "acpx_command", "") or "",
             acp_session_name=getattr(args, "acp_session_name", "researchclaw-ahvs") or "researchclaw-ahvs",

@@ -116,6 +116,102 @@ def _ahvs_config_to_rc_shim(config: AHVSConfig) -> _RCConfigShim:
 
 
 # ---------------------------------------------------------------------------
+# Type-specific execution strategies (Finding 2, v4)
+# ---------------------------------------------------------------------------
+
+_TYPE_EXECUTION_STRATEGIES: dict[str, dict[str, str]] = {
+    "prompt_rewrite": {
+        "system_addition": (
+            "You are implementing a PROMPT REWRITE hypothesis. Focus EXCLUSIVELY on:\n"
+            "- System prompt improvements (clarity, specificity, role definition)\n"
+            "- Few-shot example selection and formatting\n"
+            "- Instruction structure and ordering\n"
+            "- Output format specifications\n"
+            "DO NOT modify any code logic, algorithms, or configuration parameters.\n"
+            "Only modify prompt template files, YAML prompt configs, or string literals "
+            "containing prompts."
+        ),
+        "constraints": "Scope: prompt template files only. No algorithm or config changes.",
+        "success_guidance": "Measure output quality improvement from prompt changes alone.",
+    },
+    "model_comparison": {
+        "system_addition": (
+            "You are implementing a MODEL COMPARISON hypothesis. Focus on:\n"
+            "- Swapping model identifiers (e.g. gpt-4o → claude-sonnet-4-6)\n"
+            "- Adjusting API call parameters for the new model\n"
+            "- Ensuring output parsing is compatible with the new model's format\n"
+            "Minimal code changes — primarily config/model ID swaps."
+        ),
+        "constraints": "Scope: model IDs and API parameters only. No algorithm redesign.",
+        "success_guidance": "Compare output quality and cost across models.",
+    },
+    "config_change": {
+        "system_addition": (
+            "You are implementing a CONFIG CHANGE hypothesis. Focus on:\n"
+            "- Hyperparameter tuning: temperature, top_p, top_k, max_tokens\n"
+            "- Retrieval parameters: chunk_size, chunk_overlap, top_k results\n"
+            "- Embedding dimensions, batch sizes, similarity thresholds\n"
+            "Only modify configuration files or parameter values. No new algorithms."
+        ),
+        "constraints": "Scope: config files and numeric parameters only.",
+        "success_guidance": "Measure metric sensitivity to parameter changes.",
+    },
+    "dspy_optimize": {
+        "system_addition": (
+            "You are implementing a DSPy OPTIMIZATION hypothesis. Focus on:\n"
+            "- Creating DSPy modules (Signatures, ChainOfThought, ReAct)\n"
+            "- Defining DSPy metrics for optimization\n"
+            "- Using DSPy optimizers (BootstrapFewShot, MIPRO, BayesianSignatureOptimizer)\n"
+            "- Compiling and evaluating optimized prompts programmatically\n"
+            "This requires creating DSPy module code, not just editing prompts."
+        ),
+        "constraints": "Must use DSPy framework. Create proper DSPy modules.",
+        "success_guidance": "Use DSPy's built-in evaluation to measure improvement.",
+    },
+    "code_change": {
+        "system_addition": (
+            "You are implementing a CODE CHANGE hypothesis. Focus on REAL algorithmic changes:\n"
+            "- New or modified data processing pipelines\n"
+            "- Improved retrieval strategies (BM25, hybrid search, query expansion)\n"
+            "- Better ranking/reranking functions\n"
+            "- Enhanced text chunking or preprocessing algorithms\n"
+            "- New post-processing or answer synthesis logic\n"
+            "DO NOT just change prompts or config values. Write actual code that implements "
+            "a different algorithm or data flow."
+        ),
+        "constraints": "Must modify actual code logic, not just prompts or configs.",
+        "success_guidance": "Demonstrate algorithmic improvement via metric change.",
+    },
+    "architecture_change": {
+        "system_addition": (
+            "You are implementing an ARCHITECTURE CHANGE hypothesis. Focus on structural redesign:\n"
+            "- New retrieval pipeline components (re-rankers, query routers, caching layers)\n"
+            "- Hybrid search architectures (combining vector + keyword retrieval)\n"
+            "- Multi-stage processing pipelines\n"
+            "- New modules for context compression, document filtering, or answer verification\n"
+            "- Agent-based architectures with tool use\n"
+            "Create NEW modules/classes, not just modify existing ones. Think about data flow "
+            "and component interfaces."
+        ),
+        "constraints": "Must introduce new modules or restructure component boundaries.",
+        "success_guidance": "Demonstrate architectural improvement via metric and design clarity.",
+    },
+    "multi_llm_judge": {
+        "system_addition": (
+            "You are implementing a MULTI-LLM JUDGE hypothesis. Focus on:\n"
+            "- Multi-model consensus: query N models, aggregate answers\n"
+            "- Judge-based evaluation: use one LLM to evaluate another's output\n"
+            "- Debate/critique patterns: models critique each other's answers\n"
+            "- Confidence-weighted selection across model outputs\n"
+            "Write evaluation/judging code that coordinates multiple LLM calls."
+        ),
+        "constraints": "Must implement multi-model coordination, not single-model changes.",
+        "success_guidance": "Measure quality improvement from multi-model approach.",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
@@ -857,6 +953,16 @@ def _run_single_hypothesis(
         f"{skill_context}"
     )
 
+    # Inject type-specific execution strategy
+    type_strategy = _TYPE_EXECUTION_STRATEGIES.get(hyp_type, {})
+    if type_strategy:
+        problem += (
+            f"\n## Type-Specific Execution Strategy ({hyp_type})\n"
+            f"{type_strategy['system_addition']}\n\n"
+            f"**Constraints:** {type_strategy['constraints']}\n"
+            f"**Success Guidance:** {type_strategy['success_guidance']}\n\n"
+        )
+
     # Package hint based on hypothesis type
     pkg_hint_map = {
         "prompt_rewrite": "promptfoo",
@@ -871,7 +977,7 @@ def _run_single_hypothesis(
     t0 = time.monotonic()
     metric_value = baseline_value
     measurement_status = "not_executed"
-    skill_used = plan.get("skill") or None
+    skill_planned = plan.get("skill") or None
     error: str | None = None
     artifact_paths: list[str] = []
     worktree: HypothesisWorktree | None = None
@@ -882,8 +988,25 @@ def _run_single_hypothesis(
         worktree = HypothesisWorktree(config.repo_path, wt_path)
         worktree.create()
     except Exception as exc:  # noqa: BLE001
+        if not config.allow_sandbox_only:
+            logger.error(
+                "%s: worktree creation failed (%s) — failing hypothesis "
+                "(use --allow-sandbox-only to permit sandbox-only fallback)",
+                hyp_id, exc,
+            )
+            return (
+                HypothesisResult.make_error(
+                    hypothesis_id=hyp_id,
+                    hypothesis_type=hyp_type,
+                    primary_metric=metric_name,
+                    baseline_value=baseline_value,
+                    error=f"Worktree creation failed: {exc}",
+                ),
+                None,
+            )
         logger.warning(
-            "%s: worktree creation failed (%s) — falling back to sandbox-only",
+            "%s: worktree creation failed (%s) — falling back to sandbox-only "
+            "(--allow-sandbox-only is set)",
             hyp_id, exc,
         )
         worktree = None
@@ -1037,9 +1160,10 @@ def _run_single_hypothesis(
         artifact_paths=artifact_paths,
         raw_output_path=str(work_dir),
         duration_seconds=round(duration, 2),
-        skill_used=skill_used,
+        skill_planned=skill_planned,
         error=error,
         measurement_status=measurement_status,
+        execution_mode="sandbox_only" if worktree is None else "repo_grounded",
     )
     return result, worktree
 
@@ -1309,6 +1433,16 @@ def _execute_cycle_verify(
         "kept_worktree": best.worktree_path if best and best.worktree_path else None,
         "kept_patch": best.patch_path if best and best.patch_path else None,
         "all_patches": [r.patch_path for r in results if r.patch_path],
+        "per_hypothesis": [
+            {
+                "id": r.hypothesis_id,
+                "execution_mode": r.execution_mode,
+                "metric_value": r.metric_value,
+                "delta": r.delta,
+                "measurement_status": r.measurement_status,
+            }
+            for r in results
+        ],
         "completed_at": _utcnow_iso(),
         "artifacts_verified": required,
     }

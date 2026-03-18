@@ -311,9 +311,12 @@ def cmd_ahvs(args: argparse.Namespace) -> int:
         question=args.question,
         max_hypotheses=args.max_hypotheses,
         regression_guard_path=_Path(args.regression_guard).resolve() if args.regression_guard else None,
+        allow_sandbox_only=getattr(args, "allow_sandbox_only", False),
+        apply_best=getattr(args, "apply_best", False),
         skill_registry_path=_Path(args.skill_registry).resolve() if args.skill_registry else None,
         prompts_override_path=_Path(args.prompts).resolve() if args.prompts else None,
         llm_provider=args.provider or "anthropic",
+        llm_base_url=getattr(args, "base_url", "") or "",
         llm_model=args.model or "claude-opus-4-6",
         llm_api_key_env=args.api_key_env or "ANTHROPIC_API_KEY",
         run_dir=_Path(args.run_dir).resolve() if args.run_dir else None,
@@ -388,7 +391,110 @@ def cmd_ahvs(args: argparse.Namespace) -> int:
     )
 
     failed = [r for r in results if r.status != StageStatus.DONE]
-    return 0 if not failed else 1
+    if failed:
+        return 1
+
+    # Post-cycle: apply best hypothesis if requested
+    if config.apply_best:
+        return _apply_best(config)
+
+    return 0
+
+
+def _apply_best(config: "AHVSConfig") -> int:
+    """Apply the best hypothesis patch from a completed cycle.
+
+    Reads cycle_summary.json, applies the best patch via ``git apply``,
+    and updates baseline_metric.json with the new metric value.
+    """
+    import json
+    import subprocess
+    from datetime import datetime, timezone
+
+    summary_path = config.run_dir / "cycle_summary.json"
+    if not summary_path.exists():
+        print(f"Error: cycle_summary.json not found at {summary_path}", file=sys.stderr)
+        return 1
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    best_id = summary.get("best_hypothesis")
+    if not best_id:
+        print("[AHVS] No improving hypothesis this cycle — nothing to apply.")
+        return 0
+
+    patch_rel = summary.get("kept_patch")
+    if not patch_rel:
+        print(
+            f"[AHVS] Best hypothesis {best_id} has no patch file — "
+            "cannot apply (was it sandbox-only?).",
+            file=sys.stderr,
+        )
+        return 1
+
+    patch_path = config.run_dir / patch_rel
+    if not patch_path.exists():
+        print(f"Error: patch file not found: {patch_path}", file=sys.stderr)
+        return 1
+
+    # Dry-run check, then apply
+    try:
+        subprocess.run(
+            ["git", "apply", "--check", str(patch_path)],
+            cwd=str(config.repo_path),
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "apply", str(patch_path)],
+            cwd=str(config.repo_path),
+            check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"Error: git apply failed for {patch_path}:\n{exc.stderr}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"[AHVS] Applied patch from {best_id}: {patch_path.name}")
+
+    # Update baseline_metric.json
+    best_metric = summary.get("best_metric_value")
+    if best_metric is not None:
+        baseline_path = config.baseline_path
+        if baseline_path.exists():
+            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        else:
+            baseline = {}
+
+        metric_key = baseline.get("primary_metric", "")
+        if metric_key:
+            baseline[metric_key] = best_metric
+        baseline["recorded_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+        # Record current commit
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(config.repo_path),
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            baseline["commit"] = head
+        except subprocess.CalledProcessError:
+            pass
+
+        baseline["applied_from_cycle"] = config.run_dir.name
+        baseline["applied_hypothesis"] = best_id
+
+        baseline_path.write_text(
+            json.dumps(baseline, indent=2), encoding="utf-8"
+        )
+        print(
+            f"[AHVS] Updated {baseline_path.name}: "
+            f"{metric_key}={best_metric} (from {best_id}, cycle {config.run_dir.name})"
+        )
+
+    return 0
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -515,6 +621,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Environment variable holding the LLM API key (default: ANTHROPIC_API_KEY)",
     )
     _ = ahvs_p.add_argument(
+        "--base-url", default="",
+        help="Override LLM base URL (required for --provider openai-compatible)",
+    )
+    _ = ahvs_p.add_argument(
         "--provider", default="anthropic",
         choices=["anthropic", "openai", "openai-compatible", "openrouter", "deepseek", "acp"],
         help="LLM provider for AHVS orchestration (default: anthropic). Use 'acp' for local agent (Claude Code, Codex)",
@@ -534,6 +644,14 @@ def main(argv: list[str] | None = None) -> int:
     _ = ahvs_p.add_argument(
         "--acp-timeout", type=int, default=1800, dest="acp_timeout_sec",
         help="ACP per-prompt timeout in seconds (default: 1800). Only used with --provider acp",
+    )
+    _ = ahvs_p.add_argument(
+        "--allow-sandbox-only", action="store_true",
+        help="Allow sandbox-only fallback when git worktree creation fails",
+    )
+    _ = ahvs_p.add_argument(
+        "--apply-best", action="store_true",
+        help="Auto-apply the best improving hypothesis patch to the working tree and update baseline",
     )
     _ = ahvs_p.add_argument(
         "--run-dir",
