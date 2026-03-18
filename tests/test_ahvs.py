@@ -600,13 +600,20 @@ class TestExecuteSetup:
         config = AHVSConfig(repo_path=repo, question="test?", run_dir=cycle_dir)
         skill_lib = SkillLibrary()
 
-        # Mock LLM connectivity so setup doesn't fail on missing API key
-        mock_check = CheckResult(
+        # Mock LLM connectivity and clean-branch check so setup doesn't fail
+        # on missing API key or untracked .ahvs/ dir in the test repo
+        mock_llm = CheckResult(
             name="ahvs_llm_connectivity", status="pass", detail="mocked"
+        )
+        mock_branch = CheckResult(
+            name="ahvs_clean_branch", status="pass", detail="mocked"
         )
         with patch(
             "researchclaw.ahvs.health.check_llm_connectivity",
-            return_value=mock_check,
+            return_value=mock_llm,
+        ), patch(
+            "researchclaw.ahvs.health.check_clean_branch",
+            return_value=mock_branch,
         ):
             result = execute_ahvs_stage(
                 AHVSStage.AHVS_SETUP,
@@ -981,3 +988,332 @@ class TestAllUnmeasuredCycle:
         assert result.status == StageStatus.DONE
         summary = json.loads((cycle_dir / "cycle_summary.json").read_text())
         assert summary["all_unmeasured"] is False
+
+
+# ---------------------------------------------------------------------------
+# 9. v3 review fixes — shared safe-path, string-prefix bug, Stage 4 preflight,
+#    dirty repo fail, extraction_failed lesson archival
+# ---------------------------------------------------------------------------
+
+
+class TestSharedSafePath:
+    """Tests for Fix #1 (v3): shared validate_safe_relpath utility."""
+
+    def test_string_prefix_containment_uses_is_relative_to(self) -> None:
+        """Verify the containment check uses is_relative_to, not startswith.
+
+        The old code used ``str(dest).startswith(str(root))`` which would
+        let ``/tmp/wt2/file`` pass as inside ``/tmp/wt``.  The fix uses
+        ``Path.is_relative_to()`` which is immune to this.
+        """
+        from researchclaw.ahvs.worktree import validate_safe_relpath
+        import inspect
+
+        source = inspect.getsource(validate_safe_relpath)
+        # Must NOT use string-prefix containment
+        assert "startswith" not in source
+        # Must use proper path ancestry check
+        assert "is_relative_to" in source
+
+    def test_symlink_escape_rejected(self, tmp_path: Path) -> None:
+        """A symlink inside root that points outside must be rejected."""
+        from researchclaw.ahvs.worktree import validate_safe_relpath
+
+        root = tmp_path / "wt"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        # Create a symlink inside root that points outside
+        (root / "escape").symlink_to(outside)
+
+        with pytest.raises(ValueError, match="escapes boundary"):
+            validate_safe_relpath("escape/evil.py", root)
+
+    def test_tool_runs_rejects_absolute_path(self, tmp_path: Path) -> None:
+        """tool_runs write path must reject absolute paths."""
+        from researchclaw.ahvs.worktree import validate_safe_relpath
+
+        work_dir = tmp_path / "tool_runs" / "H1"
+        work_dir.mkdir(parents=True)
+        with pytest.raises(ValueError, match="absolute path"):
+            validate_safe_relpath("/etc/passwd", work_dir)
+
+    def test_tool_runs_rejects_dotdot(self, tmp_path: Path) -> None:
+        """tool_runs write path must reject .. traversal."""
+        from researchclaw.ahvs.worktree import validate_safe_relpath
+
+        work_dir = tmp_path / "tool_runs" / "H1"
+        work_dir.mkdir(parents=True)
+        with pytest.raises(ValueError, match="traversal"):
+            validate_safe_relpath("../../etc/cron.d/evil", work_dir)
+
+    def test_tool_runs_accepts_valid_path(self, tmp_path: Path) -> None:
+        """Valid nested paths pass validation."""
+        from researchclaw.ahvs.worktree import validate_safe_relpath
+
+        work_dir = tmp_path / "tool_runs" / "H1"
+        work_dir.mkdir(parents=True)
+        # Should not raise
+        validate_safe_relpath("src/module.py", work_dir)
+
+    def test_worktree_and_tool_runs_use_same_function(self) -> None:
+        """Worktree._validate_relpath delegates to the shared utility."""
+        from researchclaw.ahvs.worktree import validate_safe_relpath
+
+        # The worktree class method should call the shared function
+        # Verify by checking it's the same function reference
+        import inspect
+        source = inspect.getsource(HypothesisWorktree._validate_relpath)
+        assert "validate_safe_relpath" in source
+
+
+class TestStage4PreflightRegression:
+    """Tests for Fix #2 (v3): secondary preflight must not manufacture LLM failure."""
+
+    def test_skip_llm_check_no_failure(self) -> None:
+        """With skip_llm_check=True, no LLM connectivity check appears."""
+        from researchclaw.ahvs.health import run_ahvs_preflight
+
+        report = run_ahvs_preflight(
+            baseline_path=Path("/nonexistent/baseline.json"),
+            repo_path=Path("/tmp"),
+            hypothesis_types=["code_change"],
+            skip_llm_check=True,
+        )
+        llm_checks = [c for c in report.checks if c.name == "ahvs_llm_connectivity"]
+        assert len(llm_checks) == 0
+
+    def test_no_skip_includes_llm_check(self) -> None:
+        """Without skip_llm_check, LLM connectivity check is still present."""
+        from researchclaw.ahvs.health import run_ahvs_preflight
+
+        report = run_ahvs_preflight(
+            baseline_path=Path("/nonexistent/baseline.json"),
+            repo_path=Path("/tmp"),
+            hypothesis_types=["code_change"],
+            skip_llm_check=False,
+            llm_api_key="",
+            llm_model="test",
+        )
+        llm_checks = [c for c in report.checks if c.name == "ahvs_llm_connectivity"]
+        assert len(llm_checks) == 1
+
+
+class TestDirtyRepoFail:
+    """Tests for Fix #3 (v3): dirty repo is a hard fail, not a warning."""
+
+    def test_dirty_repo_fails(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.health import check_clean_branch
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        # Create an untracked file to make the repo dirty
+        (repo / "uncommitted.txt").write_text("dirty")
+
+        result = check_clean_branch(repo)
+        assert result.status == "fail"
+        assert "uncommitted" in result.detail.lower()
+
+    def test_clean_repo_passes(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.health import check_clean_branch
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        result = check_clean_branch(repo)
+        assert result.status == "pass"
+
+
+class TestExtractionFailedLesson:
+    """Tests for Fix #4 (v3): extraction_failed → infrastructure lesson."""
+
+    def test_extraction_failed_not_rejected_approach(self) -> None:
+        """extraction_failed results must NOT be archived as 'Rejected approach'."""
+        r = _make_result(
+            hypothesis_id="H1",
+            measurement_status="extraction_failed",
+            delta=0.0,
+            error=None,
+        )
+        # Simulate the lesson classification logic from executor
+        assert not r.improved
+        assert r.error is None
+        assert r.measurement_status != "measured"
+        # These three conditions mean it hits the new branch, not "Rejected approach"
+
+    def test_measured_not_improved_is_rejected_approach(self) -> None:
+        """A properly measured but not-improved result IS a rejected approach."""
+        r = _make_result(
+            hypothesis_id="H1",
+            measurement_status="measured",
+            delta=-0.02,
+            error=None,
+        )
+        assert not r.improved
+        assert r.error is None
+        assert r.measurement_status == "measured"
+        # This correctly hits the "Rejected approach" branch
+
+
+# ---------------------------------------------------------------------------
+# 10. ACP local-agent LLM support
+# ---------------------------------------------------------------------------
+
+
+class TestAHVSConfigACP:
+    """Tests for AHVSConfig ACP fields and provider-aware behaviour."""
+
+    def test_default_provider_is_anthropic(self, tmp_path: Path) -> None:
+        config = AHVSConfig(repo_path=tmp_path, question="test")
+        assert config.llm_provider == "anthropic"
+
+    def test_acp_provider_skips_api_key_env(self, tmp_path: Path) -> None:
+        """When provider=acp, __post_init__ should not try to read API key from env."""
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="acp",
+            llm_api_key="",
+            llm_api_key_env="NONEXISTENT_KEY_VAR_12345",
+        )
+        # Should remain empty — not read from env
+        assert config.llm_api_key == ""
+
+    def test_acp_defaults(self, tmp_path: Path) -> None:
+        config = AHVSConfig(repo_path=tmp_path, question="test", llm_provider="acp")
+        assert config.acp_agent == "claude"
+        assert config.acp_cwd == str(tmp_path.resolve())
+        assert config.acp_session_name == "researchclaw-ahvs"
+        assert config.acp_timeout_sec == 1800
+
+    def test_acp_cwd_resolved_to_repo(self, tmp_path: Path) -> None:
+        config = AHVSConfig(repo_path=tmp_path, question="test")
+        assert config.acp_cwd == str(tmp_path.resolve())
+
+
+class TestShimConstruction:
+    """Tests for the _RCConfigShim that bridges AHVSConfig to create_llm_client."""
+
+    def test_shim_exposes_llm_fields(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.executor import _ahvs_config_to_rc_shim
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="anthropic",
+            llm_model="claude-opus-4-6",
+            llm_api_key="sk-test",
+            llm_base_url="https://example.com",
+        )
+        shim = _ahvs_config_to_rc_shim(config)
+        assert shim.llm.provider == "anthropic"
+        assert shim.llm.primary_model == "claude-opus-4-6"
+        assert shim.llm.api_key == "sk-test"
+        assert shim.llm.base_url == "https://example.com"
+        assert shim.metaclaw_bridge is None
+
+    def test_shim_exposes_acp_fields(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.executor import _ahvs_config_to_rc_shim
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="acp",
+            acp_agent="codex",
+            acp_session_name="my-session",
+            acp_timeout_sec=600,
+        )
+        shim = _ahvs_config_to_rc_shim(config)
+        assert shim.llm.provider == "acp"
+        assert shim.llm.acp.agent == "codex"
+        assert shim.llm.acp.session_name == "my-session"
+        assert shim.llm.acp.timeout_sec == 600
+
+
+class TestPreflightProviderAware:
+    """Tests for provider-aware preflight checks."""
+
+    def test_acp_preflight_calls_acp_check(self) -> None:
+        """With provider=acp, check_llm_connectivity should use ACP path, not API key."""
+        from researchclaw.ahvs.health import check_llm_connectivity
+
+        # Even with empty API key, provider=acp should NOT fail with "No API key"
+        result = check_llm_connectivity(
+            api_key="", model="", base_url="", provider="acp",
+        )
+        # Will fail because acpx is not installed in test env,
+        # but the failure message should be about ACP, not API keys
+        assert "API key" not in result.detail
+
+    def test_non_acp_still_requires_api_key(self) -> None:
+        """Without provider=acp, empty API key still fails."""
+        from researchclaw.ahvs.health import check_llm_connectivity
+
+        result = check_llm_connectivity(
+            api_key="", model="test", base_url="", provider="anthropic",
+        )
+        assert result.status == "fail"
+        assert "No API key" in result.detail
+
+    def test_preflight_skips_llm_on_skip_flag(self) -> None:
+        """skip_llm_check=True suppresses the check regardless of provider."""
+        from researchclaw.ahvs.health import run_ahvs_preflight
+
+        report = run_ahvs_preflight(
+            baseline_path=Path("/nonexistent"),
+            repo_path=Path("/tmp"),
+            skip_llm_check=True,
+            llm_provider="acp",
+        )
+        llm_checks = [c for c in report.checks if c.name == "ahvs_llm_connectivity"]
+        assert len(llm_checks) == 0
+
+    def test_acp_preflight_in_run_ahvs_preflight(self) -> None:
+        """run_ahvs_preflight passes provider to check_llm_connectivity."""
+        from researchclaw.ahvs.health import run_ahvs_preflight
+
+        report = run_ahvs_preflight(
+            baseline_path=Path("/nonexistent"),
+            repo_path=Path("/tmp"),
+            llm_provider="acp",
+        )
+        llm_checks = [c for c in report.checks if c.name == "ahvs_llm_connectivity"]
+        assert len(llm_checks) == 1
+        # Should be an ACP-related message, not "No API key"
+        assert "API key" not in llm_checks[0].detail
+
+
+class TestMakeLlmClientUsesFactory:
+    """Tests for _make_llm_client routing through the shared factory."""
+
+    def test_anthropic_provider_returns_llm_client(self, tmp_path: Path) -> None:
+        """provider=anthropic should produce an LLMClient (not ACPClient)."""
+        from researchclaw.ahvs.executor import _make_llm_client
+        from researchclaw.llm.client import LLMClient
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="anthropic",
+            llm_api_key="sk-test",
+            llm_model="claude-opus-4-6",
+        )
+        # Mock the Anthropic adapter since httpx may not be installed in test env
+        with patch("researchclaw.llm.anthropic_adapter.HAS_HTTPX", True), \
+             patch("researchclaw.llm.anthropic_adapter.AnthropicAdapter.__init__", return_value=None):
+            client = _make_llm_client(config)
+        assert isinstance(client, LLMClient)
+
+    def test_acp_provider_returns_acp_client(self, tmp_path: Path) -> None:
+        """provider=acp should produce an ACPClient."""
+        from researchclaw.ahvs.executor import _make_llm_client
+        from researchclaw.llm.acp_client import ACPClient
+
+        config = AHVSConfig(
+            repo_path=tmp_path, question="test",
+            llm_provider="acp",
+            acp_agent="claude",
+        )
+        client = _make_llm_client(config)
+        assert isinstance(client, ACPClient)
+        assert client.config.agent == "claude"

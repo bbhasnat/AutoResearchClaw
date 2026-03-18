@@ -93,7 +93,7 @@ Each hypothesis gets its own worktree under `<cycle_dir>/worktrees/<ID>/`. This 
 - **Repo-grounded execution:** Code is tested against the actual repo, not in an isolated sandbox
 - **No branch pollution:** Worktrees are detached (no branches created)
 - **Safe concurrency:** Each hypothesis has its own copy of the repo
-- **Path containment:** Generated file paths are validated — absolute paths, `..` traversal, and symlink escapes are rejected before any file is written
+- **Path containment:** All CodeAgent-generated file paths are validated by a shared `validate_safe_relpath()` utility before writing — to both `tool_runs/` and worktree directories. Absolute paths, `..` traversal, and symlink escapes are rejected. The containment check uses `Path.is_relative_to()` (not string-prefix matching) to prevent false-positive bypasses
 - **Audit trail:** A `.patch` file is saved for every hypothesis
 
 After all hypotheses run, AHVS identifies the best improvement and keeps its worktree. All other worktrees are cleaned up. The kept worktree path and all patch paths are recorded in `cycle_summary.json`.
@@ -105,7 +105,7 @@ If the target path is not a git repository, worktree creation fails gracefully a
 ## 3. The 8-Stage Cycle
 
 ```
-Stage 1  AHVS_SETUP            Pre-flight checks (baseline, git, LLM connectivity — always runs), cycle dir init
+Stage 1  AHVS_SETUP            Pre-flight checks (baseline, clean repo, LLM connectivity — always runs), cycle dir init
 Stage 2  AHVS_CONTEXT_LOAD     Load baseline + EvolutionStore → context_bundle.json
 Stage 3  AHVS_HYPOTHESIS_GEN   LLM generates 1–5 typed hypotheses
 Stage 4  AHVS_HUMAN_SELECTION  ── GATE ── operator selects which to run
@@ -119,6 +119,8 @@ The gate at Stage 4 pauses for human input unless `--auto-approve` is passed. If
 
 Every stage writes a checkpoint. A failed stage stops the cycle; later stages are not run.
 
+> **Clean repo required:** Stage 1 pre-flight **fails** if the target repo has uncommitted changes. This is a hard requirement because AHVS creates hypothesis worktrees from committed `HEAD` — uncommitted changes in the working tree would not be included in the experiment. Commit or stash changes before starting a cycle.
+
 ---
 
 ## 4. Quick Start
@@ -127,15 +129,49 @@ Every stage writes a checkpoint. A failed stage stops the cycle; later stages ar
 
 - Python 3.11+
 - ARC installed (`pip install -e .` from this repo)
-- An API key for a Claude model (or any OpenAI-compatible endpoint)
+- **API mode:** An API key for a Claude model (or any OpenAI-compatible endpoint)
+- **ACP mode:** A local ACP-compatible agent CLI (Claude Code, Codex, etc.) + `acpx`
 
-### Step 1 — Set your API key
+AHVS supports two LLM modes for its own orchestration calls (hypothesis generation, validation planning, reporting):
+
+| Mode | Flag | API key needed? | What runs the LLM? |
+|------|------|-----------------|---------------------|
+| API provider (default) | `--provider anthropic` | Yes | Direct API call |
+| ACP local agent | `--provider acp` | No (for AHVS) | Claude Code / Codex via acpx |
+
+> **Control-plane vs runtime inference:** The `--provider` flag only controls AHVS's own orchestration LLM calls. Runtime inference inside the target repo's evaluated code (e.g. an OpenAI-powered RAG pipeline) still uses whatever credentials that codebase requires.
+
+### Step 1a — API mode (default)
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
+### Step 1b — ACP mode (no API key needed for AHVS)
+
+```bash
+# Ensure acpx is installed
+npm install -g acpx
+
+# Use a local agent for AHVS orchestration
+researchclaw ahvs \
+  --repo /path/to/repo \
+  --question "How can we improve answer_relevance?" \
+  --provider acp \
+  --acp-agent claude   # or codex, gemini, etc.
+```
+
 ### Step 2 — Onboard your target repo
+
+**Option A: Conversational onboarding (recommended)**
+
+If you're using Claude Code, just tell it what you want:
+
+> "Onboard this repo for AHVS — I want to improve answer relevance"
+
+The `ahvs_onboarding` skill will inspect your repo, identify evaluation paths, ask follow-up questions, and write `.ahvs/baseline_metric.json` for you. It refuses to proceed until the setup is valid. See `skills/ahvs_onboarding/SKILL.md` for details.
+
+**Option B: Manual setup**
 
 Create `.ahvs/baseline_metric.json` in your target repository:
 
@@ -257,6 +293,11 @@ researchclaw ahvs [options]
 | `--prompts` | none | Path to AHVS prompts override YAML |
 | `--model` | `claude-opus-4-6` | LLM model ID |
 | `--api-key-env` | `ANTHROPIC_API_KEY` | Env var holding the API key |
+| `--provider` | `anthropic` | LLM provider: `anthropic`, `openai`, `openai-compatible`, `openrouter`, `deepseek`, `acp` |
+| `--acp-agent` | `claude` | ACP agent CLI name (only with `--provider acp`) |
+| `--acpx-command` | *(auto-detect)* | Path to acpx binary (only with `--provider acp`) |
+| `--acp-session-name` | `researchclaw-ahvs` | ACP session name (only with `--provider acp`) |
+| `--acp-timeout` | `1800` | ACP per-prompt timeout in seconds (only with `--provider acp`) |
 | `--run-dir` | `<repo>/.ahvs/cycles/<ts>` | Override cycle output directory |
 
 ### Resuming a failed cycle
@@ -302,7 +343,7 @@ AHVS generates hypotheses of these types. Each type maps to the tools CodeAgent 
 | `multi_llm_judge` | Build a judge chain, evaluate with it | *(none — uses local sandbox)* |
 | `phoenix_eval` | Arize Phoenix evaluation | `arize-phoenix` |
 
-AHVS runs a pre-flight check *after* hypothesis selection to verify the tools needed for selected hypothesis types are available. If a tool is missing, AHVS warns and asks for confirmation before proceeding.
+AHVS runs a secondary pre-flight check *after* hypothesis selection (Stage 4) to verify the tools needed for selected hypothesis types are available. This check skips the LLM connectivity test (already verified at Stage 1) and focuses only on tool availability. If a tool is missing, AHVS warns and asks for confirmation before proceeding.
 
 > **Note:** In the current implementation, all hypothesis types share the same execution path through CodeAgent. The type primarily influences which skills and package hints are injected into CodeAgent's context, and which tools are checked at pre-flight. CodeAgent decides the actual execution strategy based on these inputs.
 
@@ -353,7 +394,8 @@ skills:
 AHVS uses ARC's `EvolutionStore` to persist lessons across cycles. This means:
 
 - **Successful hypotheses** are recorded as positive lessons — future cycles know what worked
-- **Failed attempts** are marked as rejected approaches — the LLM is explicitly told not to repeat them
+- **Failed attempts** (measured but not improved) are marked as rejected approaches — the LLM is explicitly told not to repeat them
+- **Infrastructure failures** (`extraction_failed`, `sandbox_error`) are recorded as warnings noting the hypothesis was never actually tested — they do *not* count as rejected approaches, so the idea can be retried in future cycles
 - **Errors** during execution are logged as warnings with enough context to diagnose
 
 The EvolutionStore lives at `<repo>/.ahvs/evolution/`. It is cumulative — never cleared between cycles.
@@ -510,6 +552,13 @@ researchclaw/ahvs/
 ├── worktree.py          # HypothesisWorktree — git worktree lifecycle per hypothesis
 ├── executor.py          # 8 stage handlers + execute_ahvs_stage() dispatcher
 └── runner.py            # execute_ahvs_cycle() — outer orchestration loop
+
+skills/ahvs_onboarding/        # Claude Code onboarding skill
+├── SKILL.md                   # Conversational wizard: repo → .ahvs/baseline_metric.json
+└── references/                # Policy docs loaded as needed
+    ├── artifact_contract.md   # Baseline JSON schema
+    ├── eval_command_policy.md  # Eval command acceptance rules
+    └── git_mode_policy.md     # Git vs non-git trust model
 ```
 
 ### Per-cycle artifacts

@@ -16,6 +16,50 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Shared path-safety utility (used by both worktree writes and tool_runs writes)
+# ---------------------------------------------------------------------------
+
+
+def validate_safe_relpath(relpath: str, root: Path) -> None:
+    """Reject *relpath* if it would escape *root* when joined.
+
+    Checks performed (in order):
+    1. Absolute path (e.g. ``/tmp/evil``)
+    2. ``..`` component anywhere in the path
+    3. Resolved destination is not a descendant of *root*
+       (catches symlink escapes and edge cases)
+
+    Uses :meth:`Path.is_relative_to` for the containment check — immune
+    to the string-prefix false-positive where ``/tmp/wt2/f`` appears to
+    be inside ``/tmp/wt``.
+
+    Raises:
+        ValueError: with a descriptive message when the path is unsafe.
+    """
+    from pathlib import PurePosixPath
+
+    pure = PurePosixPath(relpath)
+
+    if pure.is_absolute():
+        raise ValueError(
+            f"Refusing absolute path from CodeAgent output: {relpath!r}"
+        )
+
+    if ".." in pure.parts:
+        raise ValueError(
+            f"Refusing path with '..' traversal from CodeAgent output: {relpath!r}"
+        )
+
+    dest_resolved = (root / relpath).resolve()
+    root_resolved = root.resolve()
+    if not dest_resolved.is_relative_to(root_resolved):
+        raise ValueError(
+            f"Path escapes boundary: {relpath!r} "
+            f"resolves to {dest_resolved}, outside {root_resolved}"
+        )
+
+
 @dataclass(frozen=True)
 class EvalResult:
     """Outcome of running eval_command inside a hypothesis worktree."""
@@ -73,30 +117,12 @@ class HypothesisWorktree:
 
     @staticmethod
     def _validate_relpath(relpath: str, worktree_root: Path) -> None:
-        """Reject paths that escape the worktree boundary."""
-        from pathlib import PurePosixPath
+        """Reject paths that escape the worktree boundary.
 
-        pure = PurePosixPath(relpath)
-
-        # Reject absolute paths (e.g. "/tmp/evil")
-        if pure.is_absolute():
-            raise ValueError(
-                f"Refusing absolute path from CodeAgent output: {relpath!r}"
-            )
-
-        # Reject ".." anywhere in the path components
-        if ".." in pure.parts:
-            raise ValueError(
-                f"Refusing path with '..' traversal from CodeAgent output: {relpath!r}"
-            )
-
-        # Final containment check: resolved dest must be under worktree root
-        dest_resolved = (worktree_root / relpath).resolve()
-        if not str(dest_resolved).startswith(str(worktree_root)):
-            raise ValueError(
-                f"Path escapes worktree boundary: {relpath!r} "
-                f"resolves to {dest_resolved}, outside {worktree_root}"
-            )
+        Delegates to the module-level :func:`validate_safe_relpath` so
+        the same logic is reused for ``tool_runs`` writes in the executor.
+        """
+        validate_safe_relpath(relpath, worktree_root)
 
     def run_eval_command(
         self, cmd: str, timeout: int = 300

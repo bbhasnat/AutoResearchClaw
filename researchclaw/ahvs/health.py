@@ -190,7 +190,14 @@ def check_regression_guard(guard_path: Path) -> CheckResult:
 
 
 def check_clean_branch(repo_path: Path) -> CheckResult:
-    """Warn if the target repo has uncommitted changes."""
+    """Fail if the target repo has uncommitted changes.
+
+    AHVS creates hypothesis worktrees from committed HEAD, so uncommitted
+    changes in the working tree are **not** tested.  A dirty repo means
+    the operator thinks they are validating the current state, but AHVS
+    actually measures an older committed snapshot — a real reproducibility
+    trap.  Therefore this is a hard fail, not a warning.
+    """
     try:
         r = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -210,8 +217,12 @@ def check_clean_branch(repo_path: Path) -> CheckResult:
         if output:
             return CheckResult(
                 name="ahvs_clean_branch",
-                status="warn",
-                detail="Target repo has uncommitted changes — hypothesis may not start from a clean baseline",
+                status="fail",
+                detail=(
+                    "Target repo has uncommitted changes — AHVS worktrees are "
+                    "created from committed HEAD, so uncommitted work would not "
+                    "be included in the experiment"
+                ),
                 fix="Commit or stash changes before running an AHVS cycle",
             )
         return CheckResult(
@@ -232,8 +243,22 @@ def check_llm_connectivity(
     api_key: str,
     model: str,
     base_url: str = "",
+    provider: str = "",
+    ahvs_config: object | None = None,
 ) -> CheckResult:
-    """Lightweight LLM ping — send a 10-token completion to verify connectivity."""
+    """Lightweight LLM ping — verify connectivity before the cycle starts.
+
+    When *provider* is ``"acp"``, uses ``ACPClient.preflight()`` instead
+    of sending a real chat completion — no API key required.
+
+    *ahvs_config* is an optional ``AHVSConfig`` instance used only in ACP
+    mode to construct the client via the shared factory shim.
+    """
+    # ── ACP path: verify acpx + agent binary, no API key needed ──────
+    if provider == "acp":
+        return _check_llm_acp(ahvs_config)
+
+    # ── API-key path (original behaviour) ────────────────────────────
     if not api_key:
         return CheckResult(
             name="ahvs_llm_connectivity",
@@ -289,6 +314,46 @@ def check_llm_connectivity(
         )
 
 
+def _check_llm_acp(ahvs_config: object | None) -> CheckResult:
+    """ACP-specific preflight: verify acpx binary and agent CLI are available."""
+    try:
+        from researchclaw.llm.acp_client import ACPClient, ACPConfig
+
+        if ahvs_config is not None:
+            acp_cfg = ACPConfig(
+                agent=getattr(ahvs_config, "acp_agent", "claude"),
+                cwd=getattr(ahvs_config, "acp_cwd", "."),
+                acpx_command=getattr(ahvs_config, "acpx_command", ""),
+                session_name=getattr(ahvs_config, "acp_session_name", "researchclaw-ahvs"),
+                timeout_sec=getattr(ahvs_config, "acp_timeout_sec", 1800),
+            )
+        else:
+            acp_cfg = ACPConfig()
+
+        client = ACPClient(acp_cfg)
+        ok, detail = client.preflight()
+        if ok:
+            return CheckResult(
+                name="ahvs_llm_connectivity",
+                status="pass",
+                detail=f"ACP agent ready: {detail}",
+            )
+        return CheckResult(
+            name="ahvs_llm_connectivity",
+            status="fail",
+            detail=f"ACP preflight failed: {detail}",
+            fix="Install acpx (npm install -g acpx) and ensure the agent CLI is on PATH",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ACP connectivity check failed: %s", exc)
+        return CheckResult(
+            name="ahvs_llm_connectivity",
+            status="fail",
+            detail=f"ACP connectivity check failed: {exc}",
+            fix="Install acpx (npm install -g acpx) and ensure the agent CLI is on PATH",
+        )
+
+
 def run_ahvs_preflight(
     baseline_path: Path,
     repo_path: Path,
@@ -297,6 +362,9 @@ def run_ahvs_preflight(
     llm_api_key: str = "",
     llm_model: str = "",
     llm_base_url: str = "",
+    skip_llm_check: bool = False,
+    llm_provider: str = "",
+    ahvs_config: object | None = None,
 ) -> DoctorReport:
     """Run AHVS pre-flight checks.
 
@@ -306,6 +374,14 @@ def run_ahvs_preflight(
         regression_guard_path: Optional path to regression_guard.sh
         hypothesis_types: If provided, also check required tools for these types.
             Pass None for the minimal setup check (before hypothesis selection).
+        skip_llm_check: If True, skip LLM connectivity check.  Used by the
+            Stage 4 secondary preflight where connectivity was already verified
+            at Stage 1 — avoids manufacturing a false failure when LLM
+            credentials are not re-passed.
+        llm_provider: Provider string (e.g. "anthropic", "acp").  Passed to
+            ``check_llm_connectivity`` for provider-aware behaviour.
+        ahvs_config: Optional AHVSConfig, forwarded to ``check_llm_connectivity``
+            for ACP client construction.
     """
     from datetime import datetime, timezone
 
@@ -318,8 +394,13 @@ def run_ahvs_preflight(
     if commit_check is not None:
         checks.append(commit_check)
 
-    # Always run LLM check — fails early with a clear message when key is empty
-    checks.append(check_llm_connectivity(llm_api_key, llm_model, llm_base_url))
+    # Always run LLM check at setup (Stage 1).  Skip at Stage 4 secondary
+    # preflight where we only care about tool availability.
+    if not skip_llm_check:
+        checks.append(check_llm_connectivity(
+            llm_api_key, llm_model, llm_base_url,
+            provider=llm_provider, ahvs_config=ahvs_config,
+        ))
 
     if regression_guard_path is not None:
         checks.append(check_regression_guard(regression_guard_path))

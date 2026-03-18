@@ -313,9 +313,14 @@ def cmd_ahvs(args: argparse.Namespace) -> int:
         regression_guard_path=_Path(args.regression_guard).resolve() if args.regression_guard else None,
         skill_registry_path=_Path(args.skill_registry).resolve() if args.skill_registry else None,
         prompts_override_path=_Path(args.prompts).resolve() if args.prompts else None,
+        llm_provider=args.provider or "anthropic",
         llm_model=args.model or "claude-opus-4-6",
         llm_api_key_env=args.api_key_env or "ANTHROPIC_API_KEY",
         run_dir=_Path(args.run_dir).resolve() if args.run_dir else None,
+        acp_agent=getattr(args, "acp_agent", "claude") or "claude",
+        acpx_command=getattr(args, "acpx_command", "") or "",
+        acp_session_name=getattr(args, "acp_session_name", "researchclaw-ahvs") or "researchclaw-ahvs",
+        acp_timeout_sec=getattr(args, "acp_timeout_sec", 1800) or 1800,
     )
 
     from_stage: AHVSStage | None = None
@@ -508,6 +513,27 @@ def main(argv: list[str] | None = None) -> int:
     _ = ahvs_p.add_argument(
         "--api-key-env", default="ANTHROPIC_API_KEY",
         help="Environment variable holding the LLM API key (default: ANTHROPIC_API_KEY)",
+    )
+    _ = ahvs_p.add_argument(
+        "--provider", default="anthropic",
+        choices=["anthropic", "openai", "openai-compatible", "openrouter", "deepseek", "acp"],
+        help="LLM provider for AHVS orchestration (default: anthropic). Use 'acp' for local agent (Claude Code, Codex)",
+    )
+    _ = ahvs_p.add_argument(
+        "--acp-agent", default="claude",
+        help="ACP agent CLI name (default: claude). Only used with --provider acp",
+    )
+    _ = ahvs_p.add_argument(
+        "--acpx-command", default="",
+        help="Path to acpx binary (auto-detected if omitted). Only used with --provider acp",
+    )
+    _ = ahvs_p.add_argument(
+        "--acp-session-name", default="researchclaw-ahvs",
+        help="ACP session name (default: researchclaw-ahvs). Only used with --provider acp",
+    )
+    _ = ahvs_p.add_argument(
+        "--acp-timeout", type=int, default=1800, dest="acp_timeout_sec",
+        help="ACP per-prompt timeout in seconds (default: 1800). Only used with --provider acp",
     )
     _ = ahvs_p.add_argument(
         "--run-dir",

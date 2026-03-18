@@ -36,10 +36,18 @@ class AHVSConfig:
     prompts_override_path: Path | None = None  # override default AHVS prompts
 
     # ── LLM settings ─────────────────────────────────────────────────────
+    llm_provider: str = "anthropic"  # "anthropic" | "openai" | "openai-compatible" | "acp"
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = "claude-opus-4-6"
     llm_api_key_env: str = "ANTHROPIC_API_KEY"
+
+    # ── ACP settings (only used when llm_provider == "acp") ───────────
+    acp_agent: str = "claude"
+    acp_cwd: str = "."           # resolved to repo_path in __post_init__
+    acpx_command: str = ""       # auto-detect if empty
+    acp_session_name: str = "researchclaw-ahvs"
+    acp_timeout_sec: int = 1800  # per-prompt timeout
 
     def __post_init__(self) -> None:
         self.repo_path = Path(self.repo_path).resolve()
@@ -47,8 +55,10 @@ class AHVSConfig:
             self.run_dir = _default_run_dir(self.repo_path)
         else:
             self.run_dir = Path(self.run_dir).resolve()
-        if not self.llm_api_key:
+        if not self.llm_api_key and self.llm_provider != "acp":
             self.llm_api_key = os.environ.get(self.llm_api_key_env, "")
+        if self.acp_cwd == ".":
+            self.acp_cwd = str(self.repo_path)
         if self.max_hypotheses > 5:
             raise ValueError("max_hypotheses cannot exceed 5 (AHVS hard cap)")
         if self.max_hypotheses < 1:
@@ -88,6 +98,11 @@ class AHVSConfig:
                 if getattr(args, "prompts", None)
                 else None
             ),
+            llm_provider=getattr(args, "provider", "anthropic") or "anthropic",
             llm_model=getattr(args, "llm_model", "claude-sonnet-4-6"),
             llm_api_key_env=getattr(args, "llm_api_key_env", "ANTHROPIC_API_KEY"),
+            acp_agent=getattr(args, "acp_agent", "claude") or "claude",
+            acpx_command=getattr(args, "acpx_command", "") or "",
+            acp_session_name=getattr(args, "acp_session_name", "researchclaw-ahvs") or "researchclaw-ahvs",
+            acp_timeout_sec=getattr(args, "acp_timeout_sec", 1800) or 1800,
         )

@@ -55,41 +55,64 @@ def _utcnow_iso() -> str:
 
 
 def _make_llm_client(config: AHVSConfig) -> Any:
-    """Build an LLMClient from AHVSConfig LLM settings."""
-    import os
+    """Build an LLM client from AHVSConfig via the shared ARC factory.
 
-    from researchclaw.llm.client import LLMClient, LLMConfig
+    Routes through ``researchclaw.llm.create_llm_client()`` so that
+    provider selection (Anthropic, OpenAI, ACP, etc.) is handled in one
+    place.  A lightweight shim object bridges AHVSConfig fields to the
+    ``RCConfig.llm`` / ``RCConfig.metaclaw_bridge`` shape expected by
+    the factory.
+    """
+    from researchclaw.llm import create_llm_client
 
-    api_key = config.llm_api_key or os.environ.get(config.llm_api_key_env, "")
+    shim = _ahvs_config_to_rc_shim(config)
+    return create_llm_client(shim)
 
-    # Determine base_url: ARC Anthropic adapter uses its own URL internally,
-    # but we need a valid base_url for the OpenAI-compatible client.
-    # If using Anthropic directly, set to empty and let the adapter handle it.
-    base_url = config.llm_base_url or "https://api.anthropic.com/v1"
 
-    llm_cfg = LLMConfig(
-        base_url=base_url,
-        api_key=api_key,
-        primary_model=config.llm_model,
+class _AcpShim:
+    """Mimics ``AcpConfig`` for the shared LLM factory."""
+
+    __slots__ = ("agent", "cwd", "acpx_command", "session_name", "timeout_sec")
+
+    def __init__(self, config: AHVSConfig) -> None:
+        self.agent = config.acp_agent
+        self.cwd = config.acp_cwd
+        self.acpx_command = config.acpx_command
+        self.session_name = config.acp_session_name
+        self.timeout_sec = config.acp_timeout_sec
+
+
+class _LlmShim:
+    """Mimics ``LlmConfig`` for the shared LLM factory."""
+
+    __slots__ = (
+        "provider", "base_url", "api_key", "api_key_env",
+        "primary_model", "fallback_models", "acp",
     )
-    client = LLMClient(llm_cfg)
 
-    # Use the Anthropic adapter if the model looks like a Claude model
-    if any(
-        prefix in config.llm_model.lower()
-        for prefix in ("claude", "anthropic")
-    ):
-        try:
-            from researchclaw.llm.anthropic_adapter import AnthropicAdapter
+    def __init__(self, config: AHVSConfig) -> None:
+        self.provider = config.llm_provider
+        self.base_url = config.llm_base_url
+        self.api_key = config.llm_api_key
+        self.api_key_env = config.llm_api_key_env
+        self.primary_model = config.llm_model
+        self.fallback_models: tuple[str, ...] = ()
+        self.acp = _AcpShim(config)
 
-            client._anthropic = AnthropicAdapter(  # type: ignore[attr-defined]
-                api_key=api_key,
-                model=config.llm_model,
-            )
-        except (ImportError, Exception):  # noqa: BLE001
-            pass  # Fall back to OpenAI-compatible endpoint
 
-    return client
+class _RCConfigShim:
+    """Minimal shim bridging AHVSConfig to the shape ``create_llm_client`` expects."""
+
+    __slots__ = ("llm", "metaclaw_bridge")
+
+    def __init__(self, config: AHVSConfig) -> None:
+        self.llm = _LlmShim(config)
+        self.metaclaw_bridge = None  # AHVS does not use the MetaClaw proxy
+
+
+def _ahvs_config_to_rc_shim(config: AHVSConfig) -> _RCConfigShim:
+    """Convert an AHVSConfig into a shim compatible with ``create_llm_client``."""
+    return _RCConfigShim(config)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +296,8 @@ def _execute_setup(
         llm_api_key=api_key,
         llm_model=config.llm_model,
         llm_base_url=config.llm_base_url,
+        llm_provider=config.llm_provider,
+        ahvs_config=config,
     )
 
     if report.overall == "fail":
@@ -525,6 +550,7 @@ def _execute_human_selection(
             repo_path=config.repo_path,
             regression_guard_path=config.regression_guard_path,
             hypothesis_types=selected_types,
+            skip_llm_check=True,  # LLM connectivity already verified at Stage 1
         )
         failed_checks = [c for c in tool_report.checks if c.status == "fail"]
         if failed_checks:
@@ -891,9 +917,12 @@ def _run_single_hypothesis(
             pkg_hint=pkg_hint,
         )
 
-        # Write generated files to work_dir
+        # Write generated files to work_dir (with path validation)
+        from researchclaw.ahvs.worktree import validate_safe_relpath
+
         for filename, content in agent_result.files.items():
-            fpath = work_dir / filename
+            validate_safe_relpath(filename, work_dir)
+            fpath = (work_dir / filename).resolve()
             fpath.parent.mkdir(parents=True, exist_ok=True)
             fpath.write_text(content, encoding="utf-8")
             artifact_paths.append(str(fpath.relative_to(cycle_dir)))
@@ -1146,6 +1175,24 @@ def _execute_report_and_memory(
                     severity="warning",
                     description=(
                         f"[{cycle_id}] {r.hypothesis_id} ({r.hypothesis_type}) FAILED: {r.error[:150]}"
+                    ),
+                    timestamp=now,
+                    run_id=cycle_id,
+                ))
+            elif r.measurement_status != "measured":
+                # Infrastructure failure (extraction_failed, sandbox_error, etc.)
+                # — the hypothesis was never actually tested.  Do NOT record as
+                # a "Rejected approach" or it will teach AHVS to avoid ideas
+                # that were never validated.
+                lessons.append(LessonEntry(
+                    stage_name="ahvs_execution",
+                    stage_num=6,
+                    category=LessonCategory.EXPERIMENT,
+                    severity="warning",
+                    description=(
+                        f"[{cycle_id}] {r.hypothesis_id} ({r.hypothesis_type}) "
+                        f"measurement failed ({r.measurement_status}). "
+                        f"Infrastructure issue — hypothesis was not tested."
                     ),
                     timestamp=now,
                     run_id=cycle_id,
