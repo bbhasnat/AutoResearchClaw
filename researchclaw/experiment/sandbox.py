@@ -279,6 +279,9 @@ class ExperimentSandbox:
         # R5-4: Inject immutable experiment harness before copying project files
         self._inject_harness(sandbox_project)
 
+        # Snapshot original filenames so we can detect new artifacts after execution
+        original_names = {f.name for f in project_dir.iterdir() if f.is_file()}
+
         # Copy all project files (will NOT overwrite harness — harness name is unique)
         for src_file in project_dir.iterdir():
             if src_file.is_file():
@@ -326,6 +329,19 @@ class ExperimentSandbox:
             result = self._result_from_exception(
                 exc, elapsed_sec=time.monotonic() - start
             )
+
+        # Copy new runtime artifacts (e.g. result.json) back to project_dir
+        try:
+            for artifact in sandbox_project.iterdir():
+                if (
+                    artifact.is_file()
+                    and artifact.name not in original_names
+                    and artifact.name != "experiment_harness.py"
+                ):
+                    shutil.copy2(artifact, project_dir / artifact.name)
+                    logger.debug("Copied runtime artifact back: %s", artifact.name)
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to copy runtime artifacts from sandbox")
 
         return result
 

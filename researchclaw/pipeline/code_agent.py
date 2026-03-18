@@ -111,6 +111,9 @@ class CodeAgentResult:
     best_score: float = 0.0
     tree_nodes_explored: int = 0
     review_rounds: int = 0
+    best_metrics: dict[str, Any] = field(default_factory=dict)
+    best_stdout: str = ""
+    best_stderr: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +184,7 @@ class CodeAgent:
         self._runs = 0
         self._log: list[str] = []
         self._sandbox: _SandboxLike | None = None
+        self._last_sandbox_result: Any = None
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -261,6 +265,7 @@ class CodeAgent:
             f"{self._calls} LLM calls, {self._runs} sandbox runs"
         )
 
+        last_sr = self._last_sandbox_result
         return CodeAgentResult(
             files=best.files,
             architecture_spec=arch_spec,
@@ -270,6 +275,12 @@ class CodeAgent:
             best_score=best.score,
             tree_nodes_explored=nodes_explored,
             review_rounds=review_rounds,
+            best_metrics=(
+                best.metrics
+                or (dict(last_sr.metrics) if last_sr and getattr(last_sr, "metrics", None) else {})
+            ),
+            best_stdout=best.stdout or (last_sr.stdout if last_sr else ""),
+            best_stderr=best.stderr or (last_sr.stderr if last_sr else ""),
         )
 
     # ── Phase 1: Blueprint Planning ──────────────────────────────────────
@@ -801,6 +812,7 @@ class CodeAgent:
 
         for i in range(self._cfg.exec_fix_max_iterations):
             result = self._run_in_sandbox(files)
+            self._last_sandbox_result = result
             if result.returncode == 0:
                 self._log_event(f"  Exec-fix iter {i}: code runs OK")
                 break

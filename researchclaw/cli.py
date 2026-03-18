@@ -294,6 +294,98 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ahvs(args: argparse.Namespace) -> int:
+    """Run one AHVS hypothesis-validation cycle."""
+    from pathlib import Path as _Path
+    from researchclaw.ahvs.config import AHVSConfig
+    from researchclaw.ahvs.runner import execute_ahvs_cycle, read_ahvs_checkpoint
+    from researchclaw.ahvs.stages import AHVSStage, StageStatus
+
+    repo_path = _Path(args.repo).resolve()
+    if not repo_path.exists():
+        print(f"Error: repo path does not exist: {repo_path}", file=sys.stderr)
+        return 1
+
+    config = AHVSConfig(
+        repo_path=repo_path,
+        question=args.question,
+        max_hypotheses=args.max_hypotheses,
+        regression_guard_path=_Path(args.regression_guard).resolve() if args.regression_guard else None,
+        skill_registry_path=_Path(args.skill_registry).resolve() if args.skill_registry else None,
+        prompts_override_path=_Path(args.prompts).resolve() if args.prompts else None,
+        llm_model=args.model or "claude-opus-4-6",
+        llm_api_key_env=args.api_key_env or "ANTHROPIC_API_KEY",
+        run_dir=_Path(args.run_dir).resolve() if args.run_dir else None,
+    )
+
+    from_stage: AHVSStage | None = None
+    if args.from_stage:
+        try:
+            from_stage = AHVSStage[args.from_stage.upper()]
+        except KeyError:
+            valid = [s.name for s in AHVSStage]
+            print(
+                f"Error: unknown stage '{args.from_stage}'. Valid: {', '.join(valid)}",
+                file=sys.stderr,
+            )
+            return 1
+    elif args.resume:
+        # Auto-detect latest cycle dir if --run-dir was not provided
+        if not args.run_dir:
+            cycles_root = repo_path / ".ahvs" / "cycles"
+            if cycles_root.is_dir():
+                cycle_dirs = sorted(
+                    [d for d in cycles_root.iterdir() if d.is_dir()],
+                    key=lambda d: d.name,
+                    reverse=True,
+                )
+                if cycle_dirs:
+                    config.run_dir = cycle_dirs[0]
+                    print(f"[AHVS] Auto-detected latest cycle: {cycle_dirs[0].name}")
+                else:
+                    print(
+                        "Error: --resume requires a previous cycle, but no cycles found "
+                        f"under {cycles_root}",
+                        file=sys.stderr,
+                    )
+                    return 1
+            else:
+                print(
+                    "Error: --resume requires a previous cycle, but "
+                    f"{cycles_root} does not exist. Run a cycle first or pass --run-dir.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        resumed = read_ahvs_checkpoint(config.run_dir)
+        if resumed is not None:
+            # Advance one stage past the last completed checkpoint
+            from researchclaw.ahvs.stages import AHVS_NEXT_STAGE
+            nxt = AHVS_NEXT_STAGE.get(resumed)
+            if nxt is not None:
+                from_stage = nxt
+                print(f"[AHVS] Resuming from checkpoint: {nxt.name}")
+            else:
+                print("[AHVS] Checkpoint shows cycle already complete.")
+                return 0
+        else:
+            print(
+                f"Error: no checkpoint found in {config.run_dir}. "
+                "Cannot resume — start a new cycle instead.",
+                file=sys.stderr,
+            )
+            return 1
+
+    results = execute_ahvs_cycle(
+        config,
+        auto_approve=args.auto_approve,
+        from_stage=from_stage,
+    )
+
+    failed = [r for r in results if r.status != StageStatus.DONE]
+    return 0 if not failed else 1
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     from researchclaw.report import generate_report, write_report
 
@@ -368,6 +460,60 @@ def main(argv: list[str] | None = None) -> int:
         "--run-dir", required=True, help="Path to run artifacts directory"
     )
     _ = rpt_p.add_argument("--output", "-o", help="Write report to file")
+
+    ahvs_p = sub.add_parser(
+        "ahvs",
+        help="Run an AHVS hypothesis-validation cycle on a target repo",
+    )
+    _ = ahvs_p.add_argument(
+        "--repo", "-r", required=True,
+        help="Path to target repository to improve",
+    )
+    _ = ahvs_p.add_argument(
+        "--question", "-q", required=True,
+        help="Cycle question (e.g. 'How can we improve answer_relevance by 5%%?')",
+    )
+    _ = ahvs_p.add_argument(
+        "--max-hypotheses", type=int, default=3,
+        help="Maximum hypotheses to generate per cycle (default: 3, hard cap: 5)",
+    )
+    _ = ahvs_p.add_argument(
+        "--regression-guard",
+        help="Path to regression guard shell script (optional)",
+    )
+    _ = ahvs_p.add_argument(
+        "--auto-approve", action="store_true",
+        help="Skip interactive gate and run all generated hypotheses",
+    )
+    _ = ahvs_p.add_argument(
+        "--from-stage",
+        help="Start from a specific stage (e.g. AHVS_HYPOTHESIS_GEN)",
+    )
+    _ = ahvs_p.add_argument(
+        "--resume", action="store_true",
+        help="Resume from the last written checkpoint in the cycle directory",
+    )
+    _ = ahvs_p.add_argument(
+        "--skill-registry",
+        help="Path to custom skill registry YAML file (optional)",
+    )
+    _ = ahvs_p.add_argument(
+        "--prompts",
+        help="Path to AHVS prompts override YAML file (optional)",
+    )
+    _ = ahvs_p.add_argument(
+        "--model", default="claude-opus-4-6",
+        help="LLM model ID (default: claude-opus-4-6)",
+    )
+    _ = ahvs_p.add_argument(
+        "--api-key-env", default="ANTHROPIC_API_KEY",
+        help="Environment variable holding the LLM API key (default: ANTHROPIC_API_KEY)",
+    )
+    _ = ahvs_p.add_argument(
+        "--run-dir",
+        help="Override cycle output directory (default: <repo>/.ahvs/cycles/<timestamp>)",
+    )
+
     args = parser.parse_args(argv)
 
     command = cast(str | None, args.command)
@@ -382,6 +528,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_init(args)
     elif command == "report":
         return cmd_report(args)
+    elif command == "ahvs":
+        return cmd_ahvs(args)
     else:
         parser.print_help()
         return 0
