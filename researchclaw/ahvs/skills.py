@@ -103,7 +103,7 @@ BUILTIN_SKILLS: list[SkillSpec] = [
             "  output_path: tool_runs/{hypothesis_id}/sandbox_output.json"
         ),
         applicable_types=("code_change", "architecture_change", "multi_llm_judge"),
-        required_tools=("docker",),
+        required_tools=(),  # uses local ExperimentSandbox, not Docker
     ),
     SkillSpec(
         name="regression_guard",

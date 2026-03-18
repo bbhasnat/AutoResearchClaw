@@ -30,9 +30,11 @@ HYPOTHESIS_TOOL_REQUIREMENTS: dict[str, list[str]] = {
     "config_change":       ["promptfoo"],
     "dspy_optimize":       ["dspy", "promptfoo"],
     "phoenix_eval":        ["arize-phoenix"],
-    "code_change":         ["docker"],
-    "architecture_change": ["docker"],
-    "multi_llm_judge":     ["docker"],
+    # code_change, architecture_change, multi_llm_judge use the local
+    # ExperimentSandbox (python3), not Docker.  No external tool required.
+    "code_change":         [],
+    "architecture_change": [],
+    "multi_llm_judge":     [],
 }
 
 
@@ -316,8 +318,8 @@ def run_ahvs_preflight(
     if commit_check is not None:
         checks.append(commit_check)
 
-    if llm_api_key:
-        checks.append(check_llm_connectivity(llm_api_key, llm_model, llm_base_url))
+    # Always run LLM check — fails early with a clear message when key is empty
+    checks.append(check_llm_connectivity(llm_api_key, llm_model, llm_base_url))
 
     if regression_guard_path is not None:
         checks.append(check_regression_guard(regression_guard_path))

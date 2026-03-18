@@ -975,9 +975,22 @@ def _run_single_hypothesis(
 
     duration = time.monotonic() - t0
 
-    # Run regression guard
-    result_path = work_dir / "result.json"
-    guard_passed = _run_regression_guard(config.regression_guard_path, result_path)
+    # Write canonical result.json so the regression guard always has a file
+    # to inspect, regardless of which tier produced the metric.
+    canonical_result_path = work_dir / "result.json"
+    canonical_result = {
+        "hypothesis_id": hyp_id,
+        "primary_metric": metric_name,
+        metric_name: metric_value,
+        "baseline_value": baseline_value,
+        "measurement_status": measurement_status,
+    }
+    canonical_result_path.write_text(
+        json.dumps(canonical_result, indent=2), encoding="utf-8"
+    )
+
+    # Run regression guard against the canonical result
+    guard_passed = _run_regression_guard(config.regression_guard_path, canonical_result_path)
 
     delta = metric_value - baseline_value
     delta_pct = (delta / baseline_value * 100) if baseline_value != 0 else 0.0
@@ -1216,20 +1229,32 @@ def _execute_cycle_verify(
     bundle = json.loads((cycle_dir / "context_bundle.json").read_text(encoding="utf-8"))
     metric_name = bundle["baseline"]["primary_metric"]
 
-    recommendation = "no improvement this cycle — revert all changes"
-    if best:
+    extraction_failures = sum(1 for r in results if r.measurement_status == "extraction_failed")
+    measured_count = sum(1 for r in results if r.measurement_status == "measured")
+    all_unmeasured = measured_count == 0 and len(results) > 0
+
+    # Build recommendation based on measurement validity
+    if all_unmeasured:
+        recommendation = (
+            "INVALID CYCLE — all hypotheses failed measurement. "
+            "No valid comparison to baseline is possible."
+        )
+    elif best:
         recommendation = (
             f"KEEP {best.hypothesis_id}: {metric_name} improved by "
             f"{best.delta:+.4f} ({best.delta_pct:+.1f}%)"
         )
+    else:
+        recommendation = "no improvement this cycle — revert all changes"
 
-    extraction_failures = sum(1 for r in results if r.measurement_status == "extraction_failed")
     summary = {
         "cycle_id": cycle_dir.name,
         "question": config.question,
         "hypotheses_run": len(results),
+        "hypotheses_measured": measured_count,
         "hypotheses_improved": len(improved),
         "extraction_failures": extraction_failures,
+        "all_unmeasured": all_unmeasured,
         "best_hypothesis": best.hypothesis_id if best else None,
         "best_delta": best.delta if best else 0.0,
         "best_metric_value": best.metric_value if best else None,
@@ -1245,6 +1270,15 @@ def _execute_cycle_verify(
     )
 
     print(f"\n[AHVS] Cycle complete — {recommendation}")
+
+    # All-unmeasured cycle is a verification failure
+    if all_unmeasured:
+        return AHVSStageResult(
+            stage=AHVSStage.AHVS_CYCLE_VERIFY,
+            status=StageStatus.FAILED,
+            artifacts=("cycle_summary.json",),
+            error="All hypotheses failed measurement — cycle is invalid",
+        )
 
     return AHVSStageResult(
         stage=AHVSStage.AHVS_CYCLE_VERIFY,

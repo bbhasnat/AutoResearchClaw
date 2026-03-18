@@ -57,14 +57,46 @@ class HypothesisWorktree:
 
         *files* maps repo-relative paths to file contents.
         Returns list of absolute paths written.
+
+        Raises ValueError if any path would escape the worktree boundary
+        (absolute paths, ``..`` traversal, or symlink escape).
         """
         written: list[Path] = []
+        wt_resolved = self.worktree_path.resolve()
         for relpath, content in files.items():
-            dest = self.worktree_path / relpath
+            self._validate_relpath(relpath, wt_resolved)
+            dest = (self.worktree_path / relpath).resolve()
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
             written.append(dest)
         return written
+
+    @staticmethod
+    def _validate_relpath(relpath: str, worktree_root: Path) -> None:
+        """Reject paths that escape the worktree boundary."""
+        from pathlib import PurePosixPath
+
+        pure = PurePosixPath(relpath)
+
+        # Reject absolute paths (e.g. "/tmp/evil")
+        if pure.is_absolute():
+            raise ValueError(
+                f"Refusing absolute path from CodeAgent output: {relpath!r}"
+            )
+
+        # Reject ".." anywhere in the path components
+        if ".." in pure.parts:
+            raise ValueError(
+                f"Refusing path with '..' traversal from CodeAgent output: {relpath!r}"
+            )
+
+        # Final containment check: resolved dest must be under worktree root
+        dest_resolved = (worktree_root / relpath).resolve()
+        if not str(dest_resolved).startswith(str(worktree_root)):
+            raise ValueError(
+                f"Path escapes worktree boundary: {relpath!r} "
+                f"resolves to {dest_resolved}, outside {worktree_root}"
+            )
 
     def run_eval_command(
         self, cmd: str, timeout: int = 300

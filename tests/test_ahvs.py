@@ -201,6 +201,7 @@ def _make_result(**overrides: object) -> HypothesisResult:
         delta_pct=6.67,
         regression_guard_passed=True,
         eval_method="code_agent",
+        measurement_status="measured",
     )
     defaults.update(overrides)
     return HypothesisResult(**defaults)
@@ -230,7 +231,12 @@ class TestHypothesisResult:
         assert r.worktree_path == ""
         assert r.patch_path == ""
         assert r.kept is False
-        assert r.measurement_status == "not_executed"
+        assert r.measurement_status == "measured"  # helper default
+
+    def test_improved_false_extraction_failed(self) -> None:
+        """extraction_failed hypotheses must not count as improved (v2 fix #3)."""
+        r = _make_result(delta=0.05, measurement_status="extraction_failed")
+        assert r.improved is False
 
     def test_new_fields_settable(self) -> None:
         r = _make_result()
@@ -573,6 +579,7 @@ class TestExecuteSetup:
 
     def test_setup_creates_dirs(self, tmp_path: Path) -> None:
         from researchclaw.ahvs.skills import SkillLibrary
+        from researchclaw.health import CheckResult
 
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -593,13 +600,21 @@ class TestExecuteSetup:
         config = AHVSConfig(repo_path=repo, question="test?", run_dir=cycle_dir)
         skill_lib = SkillLibrary()
 
-        result = execute_ahvs_stage(
-            AHVSStage.AHVS_SETUP,
-            cycle_dir=cycle_dir,
-            config=config,
-            skill_library=skill_lib,
-            auto_approve=True,
+        # Mock LLM connectivity so setup doesn't fail on missing API key
+        mock_check = CheckResult(
+            name="ahvs_llm_connectivity", status="pass", detail="mocked"
         )
+        with patch(
+            "researchclaw.ahvs.health.check_llm_connectivity",
+            return_value=mock_check,
+        ):
+            result = execute_ahvs_stage(
+                AHVSStage.AHVS_SETUP,
+                cycle_dir=cycle_dir,
+                config=config,
+                skill_library=skill_lib,
+                auto_approve=True,
+            )
 
         assert result.status == StageStatus.DONE
         assert (cycle_dir / "tool_runs").is_dir()
@@ -728,3 +743,241 @@ class TestCycleVerify:
 
         assert result.status == StageStatus.FAILED
         assert "Missing artifacts" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# 8. v2 review fixes — path traversal, canonical result, LLM preflight,
+#    tool requirements, all-unmeasured cycle
+# ---------------------------------------------------------------------------
+
+
+class TestPathTraversal:
+    """Tests for Fix #1: apply_files rejects paths that escape the worktree."""
+
+    def test_reject_absolute_path(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        with pytest.raises(ValueError, match="absolute path"):
+            wt.apply_files({"/tmp/evil.py": "pwned"})
+        wt.cleanup()
+
+    def test_reject_dotdot_traversal(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        with pytest.raises(ValueError, match="traversal"):
+            wt.apply_files({"../../../etc/passwd": "pwned"})
+        wt.cleanup()
+
+    def test_reject_hidden_dotdot(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        with pytest.raises(ValueError, match="traversal"):
+            wt.apply_files({"src/../../outside.py": "pwned"})
+        wt.cleanup()
+
+    def test_accept_valid_nested_path(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        written = wt.apply_files({"src/deep/module.py": "x = 1\n"})
+        assert len(written) == 1
+        assert (wt_path / "src" / "deep" / "module.py").read_text() == "x = 1\n"
+        wt.cleanup()
+
+
+class TestCanonicalResult:
+    """Tests for Fix #2: regression guard runs against canonical result.json."""
+
+    def test_guard_receives_canonical_result(self, tmp_path: Path) -> None:
+        """After metric extraction, result.json should contain the measured metric."""
+        # Simulate what executor does after extraction
+        work_dir = tmp_path / "tool_runs" / "H1"
+        work_dir.mkdir(parents=True)
+
+        canonical = {
+            "hypothesis_id": "H1",
+            "primary_metric": "answer_relevance",
+            "answer_relevance": 0.85,
+            "baseline_value": 0.74,
+            "measurement_status": "measured",
+        }
+        result_path = work_dir / "result.json"
+        result_path.write_text(json.dumps(canonical))
+
+        # Guard that reads the result and checks for the metric key
+        guard = tmp_path / "guard.sh"
+        script = textwrap.dedent("""\
+            #!/bin/bash
+            python3 -c "
+            import json, sys
+            d = json.load(open(sys.argv[1]))
+            assert 'answer_relevance' in d
+            assert d['measurement_status'] == 'measured'
+            " "$1"
+        """)
+        guard.write_text(script)
+        guard.chmod(guard.stat().st_mode | stat.S_IEXEC)
+
+        assert _run_regression_guard(guard, result_path) is True
+
+
+class TestLLMPreflightAlwaysRuns:
+    """Tests for Fix #4: LLM preflight runs even when api_key is empty."""
+
+    def test_empty_key_fails_preflight(self) -> None:
+        from researchclaw.ahvs.health import run_ahvs_preflight
+
+        # Use a non-existent baseline so baseline check also fails;
+        # but we specifically check that the LLM check ran and failed.
+        report = run_ahvs_preflight(
+            baseline_path=Path("/nonexistent/baseline.json"),
+            repo_path=Path("/tmp"),
+            llm_api_key="",
+            llm_model="claude-opus-4-6",
+        )
+        llm_checks = [c for c in report.checks if c.name == "ahvs_llm_connectivity"]
+        assert len(llm_checks) == 1
+        assert llm_checks[0].status == "fail"
+        assert "No API key" in llm_checks[0].detail
+
+    def test_preflight_with_key_includes_llm_check(self) -> None:
+        from researchclaw.ahvs.health import run_ahvs_preflight
+
+        report = run_ahvs_preflight(
+            baseline_path=Path("/nonexistent/baseline.json"),
+            repo_path=Path("/tmp"),
+            llm_api_key="sk-fake-key",
+            llm_model="claude-opus-4-6",
+        )
+        llm_checks = [c for c in report.checks if c.name == "ahvs_llm_connectivity"]
+        assert len(llm_checks) == 1
+        # Will fail because the key is fake, but the check *ran*
+        assert llm_checks[0].status == "fail"
+
+
+class TestToolRequirements:
+    """Tests for Fix #5: code_change/architecture_change/multi_llm_judge don't require docker."""
+
+    def test_code_change_no_docker_requirement(self) -> None:
+        from researchclaw.ahvs.health import HYPOTHESIS_TOOL_REQUIREMENTS
+        assert "docker" not in HYPOTHESIS_TOOL_REQUIREMENTS["code_change"]
+
+    def test_architecture_change_no_docker_requirement(self) -> None:
+        from researchclaw.ahvs.health import HYPOTHESIS_TOOL_REQUIREMENTS
+        assert "docker" not in HYPOTHESIS_TOOL_REQUIREMENTS["architecture_change"]
+
+    def test_multi_llm_judge_no_docker_requirement(self) -> None:
+        from researchclaw.ahvs.health import HYPOTHESIS_TOOL_REQUIREMENTS
+        assert "docker" not in HYPOTHESIS_TOOL_REQUIREMENTS["multi_llm_judge"]
+
+    def test_sandbox_skill_no_docker_required(self) -> None:
+        from researchclaw.ahvs.skills import BUILTIN_SKILLS
+        sandbox_skills = [s for s in BUILTIN_SKILLS if s.name == "sandbox_run"]
+        assert len(sandbox_skills) == 1
+        assert "docker" not in sandbox_skills[0].required_tools
+
+
+class TestAllUnmeasuredCycle:
+    """Tests for Fix #3: all-unmeasured cycle is flagged as FAILED."""
+
+    def _setup_cycle_artifacts(self, cycle_dir: Path, measurement_status: str) -> None:
+        """Create cycle artifacts where all hypotheses have the given measurement_status."""
+        cycle_dir.mkdir(parents=True, exist_ok=True)
+
+        baseline = {
+            "primary_metric": "answer_relevance",
+            "value": 0.74,
+            "eval_command": "echo test",
+        }
+        bundle = {"baseline": baseline, "lessons": [], "rejected": []}
+        (cycle_dir / "context_bundle.json").write_text(json.dumps(bundle))
+        (cycle_dir / "cycle_manifest.json").write_text(json.dumps({"cycle_id": "test"}))
+        (cycle_dir / "hypotheses.md").write_text("# H1\n")
+        (cycle_dir / "selection.md").write_text("H1")
+        (cycle_dir / "selection.json").write_text(json.dumps({"selected": ["H1"], "rationale": "test"}))
+        (cycle_dir / "validation_plan.md").write_text("# Plan\n")
+        results = [
+            _make_result(
+                hypothesis_id="H1",
+                measurement_status=measurement_status,
+                delta=0.0,
+                delta_pct=0.0,
+                metric_value=0.74,
+            ),
+        ]
+        save_results(results, cycle_dir / "results.json")
+        (cycle_dir / "report.md").write_text("# Report\n")
+        (cycle_dir / "friction_log.md").write_text("# Friction\n")
+
+    def test_all_unmeasured_fails_cycle(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.skills import SkillLibrary
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        cycle_dir = tmp_path / "cycle_001"
+        self._setup_cycle_artifacts(cycle_dir, "extraction_failed")
+
+        config = AHVSConfig(repo_path=repo, question="test?", run_dir=cycle_dir)
+        skill_lib = SkillLibrary()
+
+        result = execute_ahvs_stage(
+            AHVSStage.AHVS_CYCLE_VERIFY,
+            cycle_dir=cycle_dir,
+            config=config,
+            skill_library=skill_lib,
+            auto_approve=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "All hypotheses failed measurement" in (result.error or "")
+
+        # Summary should still be written with all_unmeasured=True
+        summary = json.loads((cycle_dir / "cycle_summary.json").read_text())
+        assert summary["all_unmeasured"] is True
+        assert "INVALID CYCLE" in summary["recommendation"]
+
+    def test_measured_cycle_passes(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.skills import SkillLibrary
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        cycle_dir = tmp_path / "cycle_002"
+        self._setup_cycle_artifacts(cycle_dir, "measured")
+
+        config = AHVSConfig(repo_path=repo, question="test?", run_dir=cycle_dir)
+        skill_lib = SkillLibrary()
+
+        result = execute_ahvs_stage(
+            AHVSStage.AHVS_CYCLE_VERIFY,
+            cycle_dir=cycle_dir,
+            config=config,
+            skill_library=skill_lib,
+            auto_approve=True,
+        )
+
+        assert result.status == StageStatus.DONE
+        summary = json.loads((cycle_dir / "cycle_summary.json").read_text())
+        assert summary["all_unmeasured"] is False

@@ -93,6 +93,7 @@ Each hypothesis gets its own worktree under `<cycle_dir>/worktrees/<ID>/`. This 
 - **Repo-grounded execution:** Code is tested against the actual repo, not in an isolated sandbox
 - **No branch pollution:** Worktrees are detached (no branches created)
 - **Safe concurrency:** Each hypothesis has its own copy of the repo
+- **Path containment:** Generated file paths are validated — absolute paths, `..` traversal, and symlink escapes are rejected before any file is written
 - **Audit trail:** A `.patch` file is saved for every hypothesis
 
 After all hypotheses run, AHVS identifies the best improvement and keeps its worktree. All other worktrees are cleaned up. The kept worktree path and all patch paths are recorded in `cycle_summary.json`.
@@ -104,7 +105,7 @@ If the target path is not a git repository, worktree creation fails gracefully a
 ## 3. The 8-Stage Cycle
 
 ```
-Stage 1  AHVS_SETUP            Pre-flight checks (baseline, git, LLM connectivity), cycle dir init
+Stage 1  AHVS_SETUP            Pre-flight checks (baseline, git, LLM connectivity — always runs), cycle dir init
 Stage 2  AHVS_CONTEXT_LOAD     Load baseline + EvolutionStore → context_bundle.json
 Stage 3  AHVS_HYPOTHESIS_GEN   LLM generates 1–5 typed hypotheses
 Stage 4  AHVS_HUMAN_SELECTION  ── GATE ── operator selects which to run
@@ -207,13 +208,15 @@ AHVS extracts metrics using a five-tier strategy (in priority order):
 | 1 | `result.json` in work_dir or `agent_runs/*/` | Sandbox copy-back |
 | 2 | `CodeAgentResult.best_metrics` | Parsed from sandbox stdout |
 | 3 | `CodeAgentResult.best_stdout` | Raw `key: value` patterns |
-| 4 | `extraction_failed` | All tiers failed |
+| 4 | `extraction_failed` | All tiers failed — hypothesis is treated as **failed** |
 
 When `eval_command` is empty or missing, Tier 0 is skipped — backward compatible with repos that don't have it. When `eval_command` fails (non-zero exit), AHVS logs a warning and falls through to the sandbox tiers.
 
+**Important:** A hypothesis with `measurement_status="extraction_failed"` is treated as an invalid experiment — it cannot count as "improved" even if the baseline value happens to produce `delta > 0`. If *all* hypotheses in a cycle fail measurement, Stage 8 marks the entire cycle as **FAILED** with an "INVALID CYCLE" recommendation.
+
 ### 5.3 Regression guard (optional but recommended)
 
-A shell script that exits 0 if a result passes quality checks, non-zero if it regresses. **When configured, the guard is fail-closed:** if the script is missing, times out, or throws an error, AHVS treats the guard as failed and rejects the hypothesis.
+A shell script that exits 0 if a result passes quality checks, non-zero if it regresses. The guard receives the path to a **canonical `result.json`** as its first argument — this file is always written after metric extraction (from any tier), so the guard never inspects a stale or missing file. **When configured, the guard is fail-closed:** if the script is missing, times out, or throws an error, AHVS treats the guard as failed and rejects the hypothesis.
 
 ```bash
 # .ahvs/regression_guard.sh
@@ -294,9 +297,9 @@ AHVS generates hypotheses of these types. Each type maps to the tools CodeAgent 
 | `model_comparison` | Promptfoo with multiple model configs | `promptfoo` |
 | `config_change` | Promptfoo eval on modified config | `promptfoo` |
 | `dspy_optimize` | DSPy compile → Promptfoo held-out eval | `dspy`, `promptfoo` |
-| `code_change` | Custom Python script + pytest | `docker` |
-| `architecture_change` | New module + integration tests in sandbox | `docker` |
-| `multi_llm_judge` | Build a judge chain, evaluate with it | `docker` |
+| `code_change` | Custom Python script + pytest | *(none — uses local sandbox)* |
+| `architecture_change` | New module + integration tests in sandbox | *(none — uses local sandbox)* |
+| `multi_llm_judge` | Build a judge chain, evaluate with it | *(none — uses local sandbox)* |
 | `phoenix_eval` | Arize Phoenix evaluation | `arize-phoenix` |
 
 AHVS runs a pre-flight check *after* hypothesis selection to verify the tools needed for selected hypothesis types are available. If a tool is missing, AHVS warns and asks for confirmation before proceeding.
@@ -424,7 +427,7 @@ Each `HypothesisResult` includes a `measurement_status` field that tracks whethe
 | Value | Meaning |
 |---|---|
 | `"measured"` | Metric was successfully extracted from at least one source |
-| `"extraction_failed"` | Hypothesis ran but no metric could be parsed from any source — value remains at baseline |
+| `"extraction_failed"` | Hypothesis ran but no metric could be parsed from any source — treated as a **failed** hypothesis (cannot count as improved) |
 | `"sandbox_error"` | CodeAgent execution raised an exception before metric extraction |
 | `"not_executed"` | Hypothesis was not executed (default state) |
 
@@ -532,7 +535,7 @@ researchclaw/ahvs/
         │   └── H1/                   # Git worktree for hypothesis H1 (kept if best)
         └── tool_runs/
             ├── H1/                   # CodeAgent workspace for hypothesis H1
-            │   ├── result.json       # Metric output written by CodeAgent
+            │   ├── result.json       # Canonical metric result (written after any-tier extraction)
             │   ├── H1.patch          # Diff of all changes applied to worktree
             │   └── <generated files>
             └── H2/
@@ -603,6 +606,8 @@ The `cycle_summary.json` includes:
 - `kept_worktree`: path to the git worktree of the best hypothesis (if one improved)
 - `kept_patch`: path to its `.patch` file (relative to cycle_dir)
 - `all_patches`: list of `.patch` paths for every hypothesis (audit trail)
+- `all_unmeasured`: `true` if no hypothesis produced a valid measurement (cycle is invalid)
+- `hypotheses_measured`: count of hypotheses with successful metric extraction
 
 After applying the change, update the baseline:
 

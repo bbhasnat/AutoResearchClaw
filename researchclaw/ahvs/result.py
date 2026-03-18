@@ -64,8 +64,13 @@ class HypothesisResult:
 
     @property
     def improved(self) -> bool:
-        """True if this hypothesis beats the baseline."""
-        return self.delta > 0 and self.regression_guard_passed and self.error is None
+        """True if this hypothesis beats the baseline with a valid measurement."""
+        return (
+            self.delta > 0
+            and self.regression_guard_passed
+            and self.error is None
+            and self.measurement_status == "measured"
+        )
 
 
 def save_results(results: list[HypothesisResult], path: Path) -> None:
