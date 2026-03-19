@@ -997,7 +997,7 @@ class CodeAgent:
             "Output the COMPLETE fixed `{target_file}` in "
             "```filename:{target_file}``` format. Fix the root cause, "
             "not just the symptom."
-        ).format(target_file=target_file)
+        ).replace("{target_file}", target_file)
 
         sys_prompt = (
             "You are a debugging expert. Fix the specific runtime error "
