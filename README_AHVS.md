@@ -171,13 +171,21 @@ researchclaw ahvs \
 
 If you're using Claude Code, just tell it what you want:
 
-> "Onboard this repo for AHVS — I want to improve answer relevance"
+> "Onboard this repo for AHVS — I want to improve precision without tanking F1"
 
-The `ahvs_onboarding` skill will inspect your repo, identify evaluation paths, ask follow-up questions, and write `.ahvs/baseline_metric.json` for you. It refuses to proceed until the setup is valid. See `skills/ahvs_onboarding/SKILL.md` for details.
+The `ahvs_onboarding` skill will:
+1. Deep-scan your repo to understand its evaluation pipeline
+2. Create a headless CLI eval script if evaluation only exists in notebooks
+3. Ask about your optimization goals, budget constraints, and hypothesis diversity
+4. Gather prior experiment results to prevent repeating dead ends
+5. Write an enriched `.ahvs/baseline_metric.json` with metrics, constraints, system levers, and prior experiments
+6. Verify the eval command produces parseable output
+
+It refuses to proceed until the setup is verified. See `skills/ahvs_onboarding/SKILL.md` for details.
 
 **Option B: Manual setup**
 
-Create `.ahvs/baseline_metric.json` in your target repository:
+Create `.ahvs/baseline_metric.json` in your target repository (minimal):
 
 ```json
 {
@@ -185,9 +193,11 @@ Create `.ahvs/baseline_metric.json` in your target repository:
   "answer_relevance": 0.74,
   "recorded_at": "2026-03-18T10:00:00Z",
   "commit": "abc1234",
-  "eval_command": "promptfoo eval --config .ahvs/eval/baseline.yaml"
+  "eval_command": "python scripts/eval.py --dataset data/test.jsonl"
 }
 ```
+
+For better hypothesis quality, include the enriched fields (see [Section 5.1](#51-baseline-metric-file)).
 
 ### Step 3 — Run a cycle
 
@@ -219,13 +229,24 @@ AHVS needs four things from a target repo:
 
 | Field | Description |
 |---|---|
-| `primary_metric` | Name of the metric to optimise (e.g. `answer_relevance`) |
+| `primary_metric` | Name of the metric to optimise (e.g. `precision`) |
 | `<primary_metric>` | Current numeric value of that metric (float) |
 | `recorded_at` | ISO-8601 timestamp when this baseline was measured |
-| `eval_command` | Shell command that reproduces the baseline measurement |
+| `eval_command` | Headless shell command that prints `metric_name: value` to stdout |
 | `commit` | Git commit SHA when baseline was recorded. *(Recommended — AHVS emits a pre-flight warning if absent, since it cannot verify the baseline matches the current repo state.)* |
 
-**Example:**
+Enriched fields (optional but strongly recommended — improves hypothesis quality):
+
+| Field | Description |
+|---|---|
+| `optimization_goal` | Plain English description of what to optimize and constraints |
+| `regression_floor` | Secondary metrics with minimum acceptable values, e.g. `{"f1_score": 0.62}` |
+| `constraints` | Budget limits, model restrictions, hypothesis scope requirements |
+| `system_levers` | Tunable parameters: strategies, modes, algorithmic areas with file paths |
+| `prior_experiments` | Results from past experiments with config details and identified problems |
+| `notes` | Additional context (dataset size, key insights, known hard cases) |
+
+**Minimal example:**
 ```json
 {
   "primary_metric": "f1_score",
@@ -233,6 +254,31 @@ AHVS needs four things from a target repo:
   "recorded_at": "2026-03-18T09:00:00Z",
   "commit": "d4e5f6a",
   "eval_command": "python scripts/eval.py --dataset data/test.jsonl"
+}
+```
+
+**Enriched example** (produces better hypotheses):
+```json
+{
+  "primary_metric": "precision",
+  "precision": 0.7128,
+  "f1_score": 0.6699,
+  "recorded_at": "2026-03-19T10:00:00Z",
+  "commit": "9c41b35",
+  "eval_command": "cd /path/to/project && python -m package.run_eval --eval-only",
+  "optimization_goal": "Maximize precision while keeping f1_score >= 0.62",
+  "regression_floor": {"f1_score": 0.62},
+  "constraints": {
+    "model_budget": "Gemini 3.1 Flash Lite only. No expensive models.",
+    "hypothesis_scope": "Must include algorithmic changes, not just prompt rewrites."
+  },
+  "system_levers": {
+    "strategies": ["random", "keyword", "semantic"],
+    "algorithmic_areas": ["post_selector.py: selection strategy", "parsing.py: threshold tuning"]
+  },
+  "prior_experiments": {
+    "best_precision": {"config": "gpt54_kw_prv2", "precision": 0.76, "f1": 0.57, "problem": "F1 too low"}
+  }
 }
 ```
 

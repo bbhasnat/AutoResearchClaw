@@ -1,10 +1,10 @@
 ---
 name: ahvs_onboarding
 description: >-
-  Conversational onboarding wizard for AHVS (Automated Hypothesis Validation System).
-  Inspects a target repo or directory, identifies evaluation paths and metrics,
-  gathers missing details through short follow-up questions, writes
-  .ahvs/baseline_metric.json, and refuses to advance when onboarding is unsafe.
+  Onboards any repository for AHVS (Automated Hypothesis Validation System).
+  Inspects the codebase, creates a headless CLI eval script if evaluation only
+  exists in notebooks/interactive form, writes .ahvs/baseline_metric.json with
+  optimization goals and constraints, and verifies the eval command works.
   Use this skill whenever the user says "onboard for AHVS", "prepare for AHVS",
   "set up AHVS", "ahvs onboard", "get this repo ready for AHVS", or mentions
   wanting to run AHVS on a project that doesn't have .ahvs/ yet. Also trigger
@@ -15,24 +15,24 @@ description: >-
 
 # AHVS Onboarding
 
-This skill is a hard readiness gate. It turns natural-language intent into the strict `.ahvs/baseline_metric.json` contract that AHVS needs before a cycle can start.
+This skill turns any repository into an AHVS-ready target. It handles the full onboarding pipeline: codebase analysis, eval command extraction, baseline configuration, and verification.
 
-The user should never need to manually author JSON. Instead, this skill inspects the repo, infers what it can, asks only the smallest necessary follow-up questions, and writes the artifacts when everything checks out.
+The user should never need to manually author JSON or figure out what AHVS needs. This skill inspects the repo, creates whatever is missing, asks only the smallest necessary follow-up questions, and writes verified artifacts.
 
 ## What This Skill Does and Does Not Do
 
 **Does:**
-1. Inspect the target repo/directory for evaluation artifacts
-2. Infer candidate metrics, eval commands, and project type
-3. Ask short, targeted follow-up questions
-4. Validate that a reproducible evaluation path exists
-5. Write `.ahvs/baseline_metric.json` (and optional helpers) when coherent
+1. Inspect the target repo to understand its evaluation pipeline
+2. Create a headless CLI eval script when evaluation only exists in notebooks or interactive form
+3. Write `.ahvs/baseline_metric.json` with metric, constraints, system levers, and prior experiments
+4. Verify the eval command produces parseable metric output
+5. Align on optimization goals with the user (which metric, budget, hypothesis diversity)
 6. Refuse to advance when onboarding is incomplete or unsafe
 
 **Does not:**
 1. Invent baseline values or guess fake eval commands
-2. Hide reduced-trust mode when the target is not in git
-3. Start an AHVS cycle — that's a separate step after onboarding
+2. Start an AHVS cycle — that's a separate step after onboarding
+3. Hide reduced-trust mode when the target is not in git
 
 ## Return Contract
 
@@ -40,96 +40,195 @@ Every onboarding pass ends with one of three statuses:
 
 | Status | Meaning | What happens next |
 |--------|---------|-------------------|
-| `ready` | All gates passed, artifacts written | User can run `researchclaw ahvs` |
+| `ready` | All gates passed, artifacts written, eval verified | User can run `researchclaw ahvs` |
 | `needs_user_input` | Promising but missing info | Ask the follow-up, then re-evaluate |
 | `blocked` | Cannot proceed safely | Explain the blocker and what must change |
 
 Return `ready` **only** when ALL of these are true:
-1. Target path exists
+1. Target path exists and is understood
 2. Optimization metric is clearly identified
-3. A reproducible evaluation path exists
-4. Baseline value is known or just measured
+3. A **headless** evaluation command exists and has been tested
+4. Baseline value is known (from existing results or a verified run)
 5. `.ahvs/baseline_metric.json` is internally consistent
+6. The eval command stdout is parseable (prints `metric_name: value`)
 
 ## Workflow
 
-### Phase 1: Discover — Inspect Before Asking
+### Phase 1: Discover — Deep Codebase Inspection
 
-Use Glob and Read to scan the target for existing structure. Check these paths first:
+Use Glob and Read to scan the target comprehensively. Check these paths first:
 
 ```
 README*, pyproject.toml, requirements.txt, package.json, Makefile,
 .github/workflows/*, .ahvs/*, promptfoo*, eval.py, scripts/eval*,
-tests/, benchmarks/, *.yaml configs with "eval" in the name
+tests/, benchmarks/, *.yaml configs, *.ipynb notebooks,
+checkpoints/, results/, experiments.*
 ```
 
-From this inspection, infer:
-- **Project type** (Python package, Node app, RAG pipeline, ML model, etc.)
-- **Candidate metric names** (from eval configs, test output, CI logs)
-- **Likely eval commands** (from Makefile targets, CI steps, scripts)
-- **Whether `.ahvs/` already exists** (if so, validate rather than create)
+From this inspection, identify:
+- **Project type** (Python package, Node app, RAG pipeline, ML model, classifier, etc.)
+- **Evaluation pipeline** — how metrics are currently computed. This is critical:
+  - CLI script? → may be usable directly
+  - Jupyter notebook? → need to extract into a CLI script
+  - CI pipeline? → extract the eval step
+  - No evaluation? → blocked — cannot onboard
+- **Candidate metric names** (from eval output, checkpoint files, experiment registries)
+- **Existing experiments** (checkpoint files, experiment YAML, prior results)
+- **System levers** — what parameters can be tuned (models, prompts, algorithms, configs)
+- **Python environment** — which conda/venv has the project's dependencies
+- **Data dependencies** — ground truth files, datasets, API keys needed
 
-Use Grep to search for metric-like patterns:
+Use Grep to search for metric patterns:
 ```
-accuracy, relevance, f1, precision, recall, score, bleu, rouge, loss
+accuracy, relevance, f1, precision, recall, score, bleu, rouge, loss,
+eval_command, eval.py, evaluate, benchmark
 ```
 
-### Phase 2: Infer — Build a Candidate Setup
+### Phase 2: Extract or Create Eval Command
 
-From the inspection, draft a candidate:
-- `primary_metric`: the metric name to optimize
-- `eval_command`: the command that measures it
-- `baseline_value`: from an existing run, artifact, or "unknown"
-- `repo_mode`: git (worktree) or non-git (sandbox-only)
+This is the hardest and most important step. AHVS needs a shell command that:
+1. Runs headlessly (no notebook, no interactive input)
+2. Prints `metric_name: numeric_value` to stdout
+3. Is reproducible (same inputs → same output)
 
-### Phase 3: Clarify — Ask Only What's Missing
+**Case A: CLI eval script already exists**
+- Verify it prints the metric to stdout in parseable form
+- If it doesn't print to stdout, wrap it or modify output
+- Test it
 
-Good questions:
-- "What metric should AHVS optimize?"
-- "I found `make eval` — is that the right command to measure [metric]?"
-- "Should AHVS block changes that regress a secondary check?"
+**Case B: Evaluation lives in a Jupyter notebook**
+This is the most common case. Extract the eval logic into a standalone Python script:
 
-Bad questions:
-- "Please write a JSON file"
-- "Explain your architecture"
-- "Provide every field AHVS needs"
+1. Read the notebook cells to understand the full pipeline:
+   - Data loading (parquet, CSV, database, API)
+   - Inference loop (LLM calls, model predictions)
+   - Metric computation (P/R/F1, accuracy, custom metrics)
+2. Create `<package>/run_eval.py` (or similar) that:
+   - Loads config from the project's existing config file
+   - Loads ground truth data (use pandas, not Spark, for simplicity)
+   - Supports `--eval-only` mode (evaluate existing checkpoint, no inference — fast and free)
+   - Supports full run mode (inference + evaluation)
+   - Prints metrics to stdout: primary metric first, then secondary metrics
+   - Sends detailed logs to stderr (so stdout stays clean for AHVS parsing)
+   - Supports CLI overrides for key parameters (model, prompt version, etc.)
+3. Test the script works in eval-only mode against existing checkpoints
 
-If the repo inspection already answered a question, don't ask it again.
+**Case C: Evaluation is in CI or a Makefile**
+- Extract the eval command from CI config
+- Verify it works locally
+- May need env var setup
 
-### Phase 4: Validate — Check Everything
+**Case D: No evaluation exists**
+- Return `blocked` — explain that AHVS needs a measurable metric
+- Suggest how the user could create one
 
-Before writing any files:
+### Phase 3: Align — Understand Optimization Goals
 
-1. **Target exists** — verify the path with `ls`
-2. **Metric is unambiguous** — a clear name, not "quality" or "goodness"
-3. **Eval command is credible** — not a placeholder. Read `references/eval_command_policy.md` for acceptance rules
-4. **Baseline value is real** — from the user, an existing artifact, or a verified run. Never invented.
-5. **Git status** — run `git rev-parse HEAD` to check. Read `references/git_mode_policy.md`
+Ask the user (if not already clear from context):
 
-### Phase 5: Materialize — Write Artifacts
+1. **"What metric should AHVS optimize?"** — The primary metric. Must be numeric.
+2. **"Are there metrics that must not regress?"** — Secondary metrics with floors (regression guards).
+3. **"What's your model/cost budget?"** — Which models are acceptable, cost-per-row limits.
+4. **"Should hypotheses go beyond prompt changes?"** — Algorithmic changes, data strategies, threshold tuning, architecture changes.
 
-Create `.ahvs/` if needed, then write:
+Encode all answers into the baseline file. If the user says "improve precision but don't tank F1", that becomes:
+```json
+{
+  "primary_metric": "precision",
+  "regression_floor": {"f1_score": 0.62}
+}
+```
+
+### Phase 4: Gather Prior Experiments
+
+Check for existing experiment results (checkpoint files, experiment registries, reports). Prior experiments are gold for AHVS — they prevent repeating dead ends.
+
+Look for:
+- Experiment registry files (YAML, JSON)
+- Checkpoint directories with results
+- Reports or analysis documents
+- Comments in config files about what was tried
+
+Encode findings as `prior_experiments` in the baseline:
+```json
+{
+  "prior_experiments": {
+    "best_precision": {"config": "model_x_strategy_y", "precision": 0.75, "f1": 0.57, "problem": "F1 too low"},
+    "best_f1": {"config": "model_a_strategy_b", "precision": 0.71, "f1": 0.67, "problem": "Precision not high enough"}
+  }
+}
+```
+
+### Phase 5: Document System Levers
+
+Identify all tunable parameters in the codebase and encode them so AHVS generates diverse hypotheses:
+
+```json
+{
+  "constraints": {
+    "model_budget": "Use model X only. No expensive models.",
+    "hypothesis_scope": "Not limited to prompt changes. Must include algorithmic changes."
+  },
+  "system_levers": {
+    "strategies": ["list of available strategies"],
+    "scoring_modes": ["list of modes"],
+    "algorithmic_areas": [
+      "module.py: what can be changed here",
+      "other_module.py: what can be tuned"
+    ]
+  }
+}
+```
+
+This ensures AHVS hypotheses propose real algorithmic changes (post selection, threshold tuning, scoring logic) not just prompt rewrites.
+
+### Phase 6: Write and Verify Artifacts
+
+Create `.ahvs/` directory, then write:
 
 **Required: `.ahvs/baseline_metric.json`**
+
+The enriched schema (see `references/artifact_contract.md` for required fields):
 ```json
 {
   "primary_metric": "<metric_name>",
   "<metric_name>": <numeric_value>,
-  "recorded_at": "<ISO-8601 timestamp>",
-  "eval_command": "<reproducible command>",
-  "commit": "<git SHA or omit if non-git>"
+  "recorded_at": "<ISO-8601>",
+  "commit": "<git SHA>",
+  "eval_command": "<reproducible headless command>",
+  "optimization_goal": "<what to optimize and constraints in plain English>",
+  "regression_floor": {"<secondary_metric>": <minimum_value>},
+  "constraints": {"model_budget": "...", "hypothesis_scope": "..."},
+  "system_levers": {"...": "..."},
+  "prior_experiments": {"...": "..."},
+  "notes": "<context for AHVS hypothesis generation>"
 }
 ```
 
-See `references/artifact_contract.md` for the full schema and rules.
+**Required: eval script** (if created in Phase 2)
 
 **Optional:**
-- `.ahvs/regression_guard.sh` — if the user wants regression protection
-- `.ahvs/eval/*` — if a new eval config was created
+- `.ahvs/regression_guard.sh`
+- `.ahvs/eval/*`
+- `.ahvs/AHVS_preparation.md` — human-readable record of what was done
 
-After writing, summarize what was **inferred** vs what was **explicitly confirmed** by the user.
+### Phase 7: Verify — Test Everything
 
-### Phase 6: Gate — Return Status
+Before returning `ready`, run the eval command and verify:
+
+```bash
+# Run eval command, capture stdout only
+<eval_command> 2>/dev/null
+```
+
+Check that:
+1. It exits with code 0
+2. stdout contains `<primary_metric>: <numeric_value>`
+3. The value matches the baseline (or is close if it's a new measurement)
+
+If verification fails, diagnose and fix before returning `ready`.
+
+### Phase 8: Gate — Return Status
 
 Present a clear status block:
 
@@ -137,14 +236,18 @@ Present a clear status block:
 ## AHVS Onboarding: [STATUS]
 
 **Target:** /path/to/repo (git / non-git)
-**Metric:** answer_relevance = 0.74
-**Eval command:** promptfoo eval --config .ahvs/eval/baseline.yaml
-**Files written:** .ahvs/baseline_metric.json
+**Metric:** precision = 0.7128 (optimize ↑)
+**Regression floor:** f1_score >= 0.62
+**Model budget:** [constraints]
+**Eval command:** [command]
+**Eval verified:** yes — output matches baseline
+**Files written:** .ahvs/baseline_metric.json, src/package/run_eval.py
 
 **Warnings:**
-- (any caveats, e.g. "no regression guard configured")
+- (any caveats)
 
-**Next step:** Run `researchclaw ahvs --repo /path/to/repo --question "..."`
+**Next step:**
+researchclaw ahvs --repo /path/to/repo --question "..."
 ```
 
 ## Git Mode Policy
@@ -153,27 +256,27 @@ Always check `git rev-parse --is-inside-work-tree` on the target.
 
 **Git repo:**
 - Record current commit SHA in baseline
-- Explain: AHVS uses detached worktrees for per-hypothesis execution — higher trust
+- AHVS uses detached worktrees for per-hypothesis execution — higher trust
 - This is the recommended mode
 
 **Not a git repo:**
 - Do NOT block by default
 - Warn clearly: AHVS falls back to sandbox-only mode with weaker reproducibility
 - No patch tracking, no commit anchoring
-- Still works for single files and loose directories
 
 ## Failure Modes
 
 **Return `blocked` when:**
 - Target path does not exist
 - Metric is too vague to measure (e.g. "make it better")
-- No reproducible eval path can be established
-- Candidate eval fails and no credible fallback exists
+- No reproducible eval path can be established — and none can be created
+- No ground truth or benchmark data exists
 
 **Return `needs_user_input` when:**
 - Repo looks promising but metric needs confirmation
 - Found a likely eval command but it needs approval
 - Baseline value is missing but can likely be measured
+- Optimization goal or constraints are unclear
 
 ## Reference Files
 
