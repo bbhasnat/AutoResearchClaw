@@ -9,16 +9,17 @@ AHVS is a cyclic hypothesis-validation pipeline built on top of ARC (AutoResearc
 1. [Overview](#1-overview)
 2. [How AHVS Relates to ARC](#2-how-ahvs-relates-to-arc)
 3. [The 8-Stage Cycle](#3-the-8-stage-cycle)
-4. [Quick Start](#4-quick-start)
-5. [Onboarding a Target Repository](#5-onboarding-a-target-repository)
-6. [CLI Reference](#6-cli-reference)
-7. [Hypothesis Types](#7-hypothesis-types)
-8. [Skill Library](#8-skill-library)
-9. [Cross-Cycle Memory](#9-cross-cycle-memory)
-10. [Python API](#10-python-api)
-11. [Configuration Reference](#11-configuration-reference)
-12. [Directory Layout](#12-directory-layout)
-13. [Advanced Usage](#13-advanced-usage)
+4. [Three Ways to Use AHVS](#4-three-ways-to-use-ahvs)
+5. [Quick Start](#5-quick-start)
+6. [Onboarding a Target Repository](#6-onboarding-a-target-repository)
+7. [CLI Reference](#7-cli-reference)
+8. [Hypothesis Types](#8-hypothesis-types)
+9. [Skill Library](#9-skill-library)
+10. [Cross-Cycle Memory](#10-cross-cycle-memory)
+11. [Python API](#11-python-api)
+12. [Configuration Reference](#12-configuration-reference)
+13. [Directory Layout](#13-directory-layout)
+14. [Advanced Usage](#14-advanced-usage)
     - [Model Selection Strategy](#model-selection-strategy)
     - [Budget Planning for Experiments](#budget-planning-for-experiments)
     - [Execution Modes](#execution-modes)
@@ -127,7 +128,93 @@ Every stage writes a checkpoint. A failed stage stops the cycle; later stages ar
 
 ---
 
-## 4. Quick Start
+## 4. Three Ways to Use AHVS
+
+AHVS supports three usage modes depending on your workflow. All three produce identical results — same 8-stage cycle, same artifacts, same cross-cycle memory.
+
+### Mode 1: Conversational in Claude Code (recommended for most users)
+
+Just describe what you want in natural language. No commands to memorize.
+
+**Onboarding a new repo:**
+```
+> Onboard /path/to/my-project for AHVS — I want to improve precision without tanking F1
+```
+
+The `ahvs_onboarding` skill will scan your repo, create a headless eval script if needed, write `.ahvs/baseline_metric.json`, and verify everything works.
+
+**Running a cycle:**
+```
+> Run AHVS on /path/to/my-project — improve precision above 0.80 using only
+  Gemini 3.1 Flash Lite. Don't let F1 drop below 0.62. Propose algorithmic
+  changes, not just prompt tweaks. Use 2 hypotheses.
+```
+
+**Reviewing results:**
+```
+> Show me the results from the last AHVS cycle on /path/to/my-project
+```
+
+**Iterating:**
+```
+> Run another AHVS cycle — the keyword strategy worked well last time,
+  focus on that direction with 3 hypotheses
+```
+
+Claude Code reads `.ahvs/baseline_metric.json` for all the details (eval command, constraints, system levers, prior experiments) so you don't need to repeat them every time.
+
+### Mode 2: CLI command
+
+For scripting, CI integration, or when you prefer explicit commands:
+
+```bash
+researchclaw ahvs \
+  --repo /path/to/my-project \
+  --question "Improve precision above 0.80 while keeping F1 >= 0.62" \
+  --max-hypotheses 2 \
+  --provider openrouter \
+  --model anthropic/claude-sonnet-4-6 \
+  --api-key-env OPENROUTER_API_KEY
+```
+
+Add `--auto-approve` for unattended runs. See [CLI Reference](#7-cli-reference) for all flags.
+
+### Mode 3: Python API
+
+For integration into existing scripts or notebooks:
+
+```python
+from researchclaw.ahvs import AHVSConfig, execute_ahvs_cycle
+
+config = AHVSConfig(
+    repo_path="/path/to/my-project",
+    question="Improve precision above 0.80 while keeping F1 >= 0.62",
+    max_hypotheses=2,
+    llm_model="claude-sonnet-4-6",
+    llm_api_key_env="OPENROUTER_API_KEY",
+)
+
+results = execute_ahvs_cycle(config, auto_approve=True)
+for r in results:
+    print(r.stage.name, r.status.value)
+```
+
+See [Python API](#11-python-api) for resumption, callbacks, and result inspection.
+
+### Which mode should I use?
+
+| Scenario | Recommended mode |
+|----------|-----------------|
+| First time using AHVS | **Conversational** — Claude guides you through onboarding |
+| Exploring what to optimize | **Conversational** — describe goals in natural language |
+| Running a specific experiment | **CLI** or **Conversational** — both work equally |
+| CI/CD integration | **CLI** with `--auto-approve` |
+| Scripting multi-cycle campaigns | **CLI** (bash loop) or **Python API** |
+| Embedding in existing workflows | **Python API** |
+
+---
+
+## 5. Quick Start
 
 ### Prerequisites
 
@@ -197,9 +284,18 @@ Create `.ahvs/baseline_metric.json` in your target repository (minimal):
 }
 ```
 
-For better hypothesis quality, include the enriched fields (see [Section 5.1](#51-baseline-metric-file)).
+For better hypothesis quality, include the enriched fields (see [Section 6.1](#61-baseline-metric-file)).
 
 ### Step 3 — Run a cycle
+
+**Option A: Conversational (in Claude Code)**
+
+```
+> Run AHVS on /path/to/your-rag-project — improve answer_relevance by at least 5%.
+  Use 3 hypotheses.
+```
+
+**Option B: CLI**
 
 ```bash
 researchclaw ahvs \
@@ -208,7 +304,7 @@ researchclaw ahvs \
   --max-hypotheses 3
 ```
 
-The CLI will pause at Stage 4 and display the generated hypotheses. Enter the IDs you want to test (e.g. `H1 H3`) or `all`.
+Both modes pause at Stage 4 to display generated hypotheses. Enter the IDs you want to test (e.g. `H1 H3`) or `all`. Pass `--auto-approve` to skip this gate.
 
 ### Step 4 — Review results
 
@@ -217,13 +313,15 @@ cat /path/to/your-rag-project/.ahvs/cycles/<timestamp>/cycle_summary.json
 cat /path/to/your-rag-project/.ahvs/cycles/<timestamp>/report.md
 ```
 
+Or conversationally: `> Show me the results from the last AHVS cycle`
+
 ---
 
-## 5. Onboarding a Target Repository
+## 6. Onboarding a Target Repository
 
 AHVS needs four things from a target repo:
 
-### 5.1 Baseline metric file
+### 6.1 Baseline metric file
 
 `.ahvs/baseline_metric.json` — required fields:
 
@@ -282,7 +380,7 @@ Enriched fields (optional but strongly recommended — improves hypothesis quali
 }
 ```
 
-### 5.2 Evaluation setup
+### 6.2 Evaluation setup
 
 Your `eval_command` is **executed in a git worktree** of the target repo after CodeAgent's generated files are applied. It must be reproducible and must write a numeric result that can be parsed.
 
@@ -300,7 +398,7 @@ When `eval_command` is empty or missing, Tier 0 is skipped — backward compatib
 
 **Important:** A hypothesis with `measurement_status="extraction_failed"` is treated as an invalid experiment — it cannot count as "improved" even if the baseline value happens to produce `delta > 0`. If *all* hypotheses in a cycle fail measurement, Stage 8 marks the entire cycle as **FAILED** with an "INVALID CYCLE" recommendation.
 
-### 5.3 Regression guard (optional but recommended)
+### 6.3 Regression guard (optional but recommended)
 
 A shell script that exits 0 if a result passes quality checks, non-zero if it regresses. The guard receives the path to a **canonical `result.json`** as its first argument — this file is always written after metric extraction (from any tier), so the guard never inspects a stale or missing file. **When configured, the guard is fail-closed:** if the script is missing, times out, or throws an error, AHVS treats the guard as failed and rejects the hypothesis.
 
@@ -318,13 +416,13 @@ researchclaw ahvs --repo . --question "..." \
   --regression-guard .ahvs/regression_guard.sh
 ```
 
-### 5.4 Domain context (automatic)
+### 6.4 Domain context (automatic)
 
 AHVS infers domain tags (`llm`, `rag`, `ml`, `prompt-driven`) by scanning `requirements.txt`, `pyproject.toml`, and `package.json`. These tags guide hypothesis generation without any manual setup.
 
 ---
 
-## 6. CLI Reference
+## 7. CLI Reference
 
 ```
 researchclaw ahvs [options]
@@ -381,7 +479,7 @@ researchclaw ahvs \
 
 ---
 
-## 7. Hypothesis Types
+## 8. Hypothesis Types
 
 AHVS generates hypotheses of these types. Each type controls what instructions, constraints, and package hints CodeAgent receives:
 
@@ -413,7 +511,7 @@ AHVS runs a secondary pre-flight check *after* hypothesis selection (Stage 4) to
 
 ---
 
-## 8. Skill Library
+## 9. Skill Library
 
 Skills are pre-built guidance templates injected into CodeAgent's prompt context. CodeAgent reads them, picks the right one, and references it in its implementation plan. Skills are **informational** — they tell CodeAgent what tools are available and how to use them, but AHVS does not enforce or dispatch skill invocations at runtime. The `skill_planned` field in `HypothesisResult` reflects the plan's declared skill, not a runtime observation.
 
@@ -453,7 +551,7 @@ skills:
 
 ---
 
-## 9. Cross-Cycle Memory
+## 10. Cross-Cycle Memory
 
 AHVS uses ARC's `EvolutionStore` to persist lessons across cycles. This means:
 
@@ -468,7 +566,7 @@ At Stage 2 (`AHVS_CONTEXT_LOAD`), AHVS queries the last 12 lessons from the stor
 
 ---
 
-## 10. Python API
+## 11. Python API
 
 ```python
 from researchclaw.ahvs import AHVSConfig, execute_ahvs_cycle
@@ -552,7 +650,7 @@ Each `HypothesisResult` includes a `measurement_status` field that tracks whethe
 
 ---
 
-## 11. Configuration Reference
+## 12. Configuration Reference
 
 ### `AHVSConfig` fields
 
@@ -598,7 +696,7 @@ Only the fields you specify are overridden; unspecified fields retain their defa
 
 ---
 
-## 12. Directory Layout
+## 13. Directory Layout
 
 ### Package structure
 
@@ -656,7 +754,7 @@ skills/ahvs_onboarding/        # Claude Code onboarding skill
 
 ---
 
-## 13. Advanced Usage
+## 14. Advanced Usage
 
 ### Running multiple cycles in sequence
 
