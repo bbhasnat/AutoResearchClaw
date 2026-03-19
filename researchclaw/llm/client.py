@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import time
+import http.client
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -287,6 +288,17 @@ class LLMClient:
             except urllib.error.URLError:
                 if attempt < self.config.max_retries - 1:
                     delay = self.config.retry_base_delay * (2**attempt)
+                    time.sleep(delay)
+                    continue
+                raise
+            except (http.client.IncompleteRead, ConnectionResetError, OSError) as exc:
+                # Transient network errors (chunked response truncated, connection reset)
+                if attempt < self.config.max_retries - 1:
+                    delay = self.config.retry_base_delay * (2**attempt)
+                    logger.info(
+                        "Retry %d/%d for %s (network error: %s). Waiting %.1fs.",
+                        attempt + 1, self.config.max_retries, model, exc, delay,
+                    )
                     time.sleep(delay)
                     continue
                 raise
