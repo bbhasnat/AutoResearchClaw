@@ -120,7 +120,15 @@ Stage 7  AHVS_REPORT_MEMORY    LLM writes cycle report; lessons → EvolutionSto
 Stage 8  AHVS_CYCLE_VERIFY     Validate all artifacts; write cycle_summary.json
 ```
 
-The gate at Stage 4 pauses for human input unless `--auto-approve` is passed. If the operator aborts, the cycle can be resumed from Stage 3 to regenerate hypotheses.
+The gate at Stage 4 pauses for human input. It supports three selection modes:
+
+1. **Pre-specified** — If `selection.json` already exists in the cycle directory (e.g. written by a conversational Claude Code session), the gate honours it and skips all prompts. This is how conversational mode works: Claude shows you the hypotheses, you say which to run, Claude writes `selection.json`, and the executor respects your choice.
+2. **Auto-approve** (`--auto-approve`) — Selects all hypotheses. For CI/scripted runs.
+3. **Interactive** (default for CLI) — Prompts on stdin. Enter IDs (e.g. `H1 H3`), `all`, or `none` to abort.
+
+You can also use `--selection H1,H3` on the CLI to pre-specify which hypotheses to run without interactive prompts.
+
+If the operator aborts, the cycle can be resumed from Stage 3 to regenerate hypotheses.
 
 Every stage writes a checkpoint. A failed stage stops the cycle; later stages are not run.
 
@@ -304,7 +312,7 @@ researchclaw ahvs \
   --max-hypotheses 3
 ```
 
-Both modes pause at Stage 4 to display generated hypotheses. Enter the IDs you want to test (e.g. `H1 H3`) or `all`. Pass `--auto-approve` to skip this gate.
+Both modes pause at Stage 4 to display generated hypotheses. In conversational mode, Claude asks which hypotheses to run and writes your choice to `selection.json`. In CLI mode, enter the IDs you want to test (e.g. `H1 H3`) or `all`, or use `--selection H1,H3` to pre-specify. Pass `--auto-approve` to skip this gate entirely.
 
 ### Step 4 — Review results
 
@@ -434,6 +442,7 @@ researchclaw ahvs [options]
 | `--question`, `-q` | *(required)* | The cycle question (what to improve) |
 | `--max-hypotheses` | `3` | How many hypotheses to generate (max 5) |
 | `--auto-approve` | off | Skip interactive gate; run all hypotheses |
+| `--selection` | none | Pre-specify hypotheses to run (e.g. `H1,H3`). For conversational/agent-driven mode. |
 | `--from-stage` | *(stage 1)* | Resume from a specific stage name |
 | `--resume` | off | Resume from last written checkpoint |
 | `--regression-guard` | none | Path to regression guard shell script |

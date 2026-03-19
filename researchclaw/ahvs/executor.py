@@ -347,6 +347,7 @@ def _run_regression_guard(guard_path: Path | None, results_path: Path) -> bool:
 
 def _make_sandbox_factory(config: AHVSConfig) -> Any:
     """Return a sandbox factory callable for CodeAgent."""
+    import sys
     from researchclaw.config import (
         ExperimentConfig,
         SandboxConfig,
@@ -356,9 +357,11 @@ def _make_sandbox_factory(config: AHVSConfig) -> Any:
     )
     from researchclaw.experiment.sandbox import ExperimentSandbox
 
+    python_path = sys.executable  # absolute path to current interpreter
+
     def _factory(exp_config: Any, workdir: Path) -> Any:
         return ExperimentSandbox(
-            SandboxConfig(python_path="python3"),
+            SandboxConfig(python_path=python_path),
             workdir,
         )
 
@@ -570,7 +573,22 @@ def _execute_human_selection(
     skill_library: SkillLibrary,
     auto_approve: bool,
 ) -> AHVSStageResult:
-    """Stage 4 (GATE): Display hypotheses to operator; record selection."""
+    """Stage 4 (GATE): Display hypotheses to operator; record selection.
+
+    Supports three selection modes:
+
+    1. **Pre-specified** (``selection.json`` already exists in ``cycle_dir``):
+       Used by conversational/agent-driven callers (e.g. Claude Code) that
+       collect the user's choice *before* invoking the executor.  The file
+       must contain ``{"selected": ["H1", ...], "rationale": "..."}``.
+       When this file is found, the gate honours it and skips all prompts.
+
+    2. **Auto-approve** (``auto_approve=True``):
+       Selects every hypothesis.  Used for CI / scripted runs.
+
+    3. **Interactive** (default):
+       Prompts the operator on stdin.
+    """
     hyp_path = cycle_dir / "hypotheses.md"
     if not hyp_path.exists():
         return AHVSStageResult(
@@ -584,58 +602,104 @@ def _execute_human_selection(
     hypotheses = _parse_hypotheses(hypotheses_text)
     all_ids = [h["id"] for h in hypotheses]
 
+    # ── Mode 1: Pre-specified selection.json ──────────────────────────
+    pre_sel_path = cycle_dir / "selection.json"
+    if pre_sel_path.exists():
+        try:
+            pre_sel = json.loads(pre_sel_path.read_text(encoding="utf-8"))
+            pre_selected = [
+                s.upper()
+                for s in pre_sel.get("selected", [])
+                if s.upper() in all_ids
+            ]
+        except (json.JSONDecodeError, TypeError):
+            pre_selected = []
+
+        if pre_selected:
+            rationale = pre_sel.get("rationale", "caller-provided selection")
+            approved_by = pre_sel.get("approved_by", "caller")
+            selected = pre_selected
+            print(
+                f"\n[AHVS] Pre-specified selection: {', '.join(selected)} "
+                f"(approved_by={approved_by})"
+            )
+            return _finalize_selection(
+                cycle_dir, config, hypotheses, selected, rationale,
+                approved_by, auto_approve,
+            )
+
+    # ── Mode 2: Auto-approve ──────────────────────────────────────────
     if auto_approve:
-        # Non-interactive: select all hypotheses
         selected = all_ids
         rationale = "auto-approve: all hypotheses selected"
         print(
             f"\n[AHVS] Auto-approve: selecting all {len(selected)} hypothesis/hypotheses: "
             f"{', '.join(selected)}"
         )
+        return _finalize_selection(
+            cycle_dir, config, hypotheses, selected, rationale,
+            "auto", auto_approve,
+        )
+
+    # ── Mode 3: Interactive gate ──────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("AHVS HUMAN SELECTION — Cycle Gate")
+    print("=" * 70)
+    print(f"\nQuestion: {config.question}\n")
+    print(hypotheses_text)
+    print("=" * 70)
+    print(f"Available hypotheses: {', '.join(all_ids)}")
+    print("Enter IDs to run (e.g. 'H1 H2', 'all', or 'none' to abort):")
+
+    try:
+        raw = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raw = "none"
+
+    if raw.lower() == "none" or not raw:
+        return AHVSStageResult(
+            stage=AHVSStage.AHVS_HUMAN_SELECTION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error="Operator aborted cycle at hypothesis selection",
+        )
+    if raw.lower() == "all":
+        selected = all_ids
     else:
-        # Interactive gate
-        print("\n" + "=" * 70)
-        print("AHVS HUMAN SELECTION — Cycle Gate")
-        print("=" * 70)
-        print(f"\nQuestion: {config.question}\n")
-        print(hypotheses_text)
-        print("=" * 70)
-        print(f"Available hypotheses: {', '.join(all_ids)}")
-        print("Enter IDs to run (e.g. 'H1 H2', 'all', or 'none' to abort):")
-
-        try:
-            raw = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            raw = "none"
-
-        if raw.lower() == "none" or not raw:
+        selected = [s.strip() for s in re.findall(r"H\d+", raw, re.IGNORECASE)]
+        selected = [s.upper() for s in selected if s.upper() in all_ids]
+        if not selected:
             return AHVSStageResult(
                 stage=AHVSStage.AHVS_HUMAN_SELECTION,
                 status=StageStatus.FAILED,
                 artifacts=(),
-                error="Operator aborted cycle at hypothesis selection",
+                error=f"No valid hypothesis IDs found in input: '{raw}'",
             )
-        if raw.lower() == "all":
-            selected = all_ids
-        else:
-            selected = [s.strip() for s in re.findall(r"H\d+", raw, re.IGNORECASE)]
-            selected = [s.upper() for s in selected if s.upper() in all_ids]
-            if not selected:
-                return AHVSStageResult(
-                    stage=AHVSStage.AHVS_HUMAN_SELECTION,
-                    status=StageStatus.FAILED,
-                    artifacts=(),
-                    error=f"No valid hypothesis IDs found in input: '{raw}'",
-                )
 
-        print(f"\nRationale for selection (optional, press Enter to skip):")
-        try:
-            rationale = input("> ").strip() or "Operator selection"
-        except (EOFError, KeyboardInterrupt):
-            rationale = "Operator selection"
+    print(f"\nRationale for selection (optional, press Enter to skip):")
+    try:
+        rationale = input("> ").strip() or "Operator selection"
+    except (EOFError, KeyboardInterrupt):
+        rationale = "Operator selection"
 
-        print(f"\n[AHVS] Selected: {', '.join(selected)}")
+    print(f"\n[AHVS] Selected: {', '.join(selected)}")
 
+    return _finalize_selection(
+        cycle_dir, config, hypotheses, selected, rationale,
+        "operator", auto_approve,
+    )
+
+
+def _finalize_selection(
+    cycle_dir: Path,
+    config: AHVSConfig,
+    hypotheses: list[dict],
+    selected: list[str],
+    rationale: str,
+    approved_by: str,
+    auto_approve: bool,
+) -> AHVSStageResult:
+    """Run pre-flight checks, write selection artifacts, return stage result."""
     # Run secondary pre-flight for the selected hypothesis types
     selected_types = [
         h["type"] for h in hypotheses if h["id"] in selected
@@ -652,8 +716,11 @@ def _execute_human_selection(
         if failed_checks:
             details = "; ".join(c.detail for c in failed_checks)
             print(f"\n[AHVS] WARNING: Tool pre-flight issues: {details}")
-            if auto_approve:
-                logger.warning("Auto-approve: continuing despite tool pre-flight failures")
+            if auto_approve or approved_by == "caller":
+                logger.warning(
+                    "%s mode: continuing despite tool pre-flight failures",
+                    approved_by,
+                )
             else:
                 print("[AHVS] Some hypotheses may fail at execution. Continue anyway? (y/N)")
                 try:
@@ -671,7 +738,7 @@ def _execute_human_selection(
     selection = {
         "selected": selected,
         "rationale": rationale,
-        "approved_by": "auto" if auto_approve else "operator",
+        "approved_by": approved_by,
         "timestamp": _utcnow_iso(),
     }
     sel_path = cycle_dir / "selection.md"

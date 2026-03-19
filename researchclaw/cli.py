@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -384,6 +386,25 @@ def cmd_ahvs(args: argparse.Namespace) -> int:
             )
             return 1
 
+    # Pre-write selection.json if --selection was provided
+    if getattr(args, "selection", None):
+        sel_ids = [
+            s.strip().upper()
+            for s in re.split(r"[,\s]+", args.selection)
+            if s.strip()
+        ]
+        if sel_ids:
+            sel_data = {
+                "selected": sel_ids,
+                "rationale": "CLI --selection flag",
+                "approved_by": "caller",
+            }
+            config.run_dir.mkdir(parents=True, exist_ok=True)
+            (config.run_dir / "selection.json").write_text(
+                json.dumps(sel_data, indent=2), encoding="utf-8"
+            )
+            print(f"[AHVS] Pre-specified selection: {', '.join(sel_ids)}")
+
     results = execute_ahvs_cycle(
         config,
         auto_approve=args.auto_approve,
@@ -595,6 +616,16 @@ def main(argv: list[str] | None = None) -> int:
     _ = ahvs_p.add_argument(
         "--auto-approve", action="store_true",
         help="Skip interactive gate and run all generated hypotheses",
+    )
+    _ = ahvs_p.add_argument(
+        "--selection",
+        help=(
+            "Pre-specify which hypotheses to run (e.g. 'H1,H3'). "
+            "For conversational/agent-driven mode: the caller writes "
+            "selection.json into the cycle dir before the gate stage runs. "
+            "This flag is a convenience shortcut that writes selection.json "
+            "from the command line."
+        ),
     )
     _ = ahvs_p.add_argument(
         "--from-stage",
