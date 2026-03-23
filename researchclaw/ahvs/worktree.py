@@ -78,6 +78,10 @@ class HypothesisWorktree:
         self.repo_path = repo_path
         self.worktree_path = worktree_path
         self._created = False
+        # eval_cwd is set in create() to handle the case where repo_path is a
+        # subdirectory of the git root (the worktree is always rooted at the
+        # git root, so eval_command must cd into the subdir before running).
+        self.eval_cwd: Path = worktree_path
 
     # ------------------------------------------------------------------
     # Public API
@@ -96,20 +100,60 @@ class HypothesisWorktree:
         self._created = True
         logger.info("Created worktree at %s", self.worktree_path)
 
+        # Compute eval_cwd: if repo_path is a subdirectory of the git root,
+        # eval_command must run from the corresponding subdir in the worktree.
+        git_root_result = self._run_git(
+            ["rev-parse", "--show-toplevel"],
+            cwd=self.repo_path,
+        )
+        if git_root_result and git_root_result.returncode == 0:
+            git_root = Path(git_root_result.stdout.strip()).resolve()
+            repo_resolved = self.repo_path.resolve()
+            if repo_resolved != git_root:
+                try:
+                    subdir = repo_resolved.relative_to(git_root)
+                    self.eval_cwd = self.worktree_path / subdir
+                    logger.info(
+                        "repo_path is a git subdir; eval_cwd set to %s", self.eval_cwd
+                    )
+                except ValueError:
+                    pass  # repo_path not under git_root — use worktree root
+
+        # Verify eval_cwd exists after checkout.  If it's missing the worktree
+        # was created but the expected subdir is absent — surface this clearly
+        # rather than letting it fail with a confusing ENOENT later.
+        if not self.eval_cwd.exists():
+            raise RuntimeError(
+                f"Worktree created at {self.worktree_path} but expected "
+                f"eval_cwd {self.eval_cwd} does not exist.  "
+                "Check that the repo subdir is tracked on the current HEAD "
+                "and that the CodeAgent did not delete it during generation."
+            )
+
     def apply_files(self, files: dict[str, str]) -> list[Path]:
         """Write CodeAgent-generated files into the worktree.
 
-        *files* maps repo-relative paths to file contents.
+        *files* maps repo-relative paths to file contents.  When repo_path is
+        a subdirectory of the git root, paths are resolved relative to
+        ``eval_cwd`` (the repo subdir within the worktree) so that
+        CodeAgent-generated paths like ``src/autoqa/parsing.py`` land at
+        ``{worktree}/{repo_subdir}/src/autoqa/parsing.py`` rather than the
+        wrong location at the worktree root.
+
         Returns list of absolute paths written.
 
-        Raises ValueError if any path would escape the worktree boundary
+        Raises ValueError if any path would escape the repo boundary
         (absolute paths, ``..`` traversal, or symlink escape).
         """
         written: list[Path] = []
-        wt_resolved = self.worktree_path.resolve()
+        # Use eval_cwd as the write base: CodeAgent generates paths relative
+        # to --repo (e.g. src/autoqa/parsing.py).  eval_cwd is the repo subdir
+        # within the worktree, so files land in the correct location.
+        base = self.eval_cwd
+        base_resolved = base.resolve()
         for relpath, content in files.items():
-            self._validate_relpath(relpath, wt_resolved)
-            dest = (self.worktree_path / relpath).resolve()
+            self._validate_relpath(relpath, base_resolved)
+            dest = (base / relpath).resolve()
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
             written.append(dest)
@@ -128,12 +172,26 @@ class HypothesisWorktree:
         self, cmd: str, timeout: int = 300
     ) -> EvalResult:
         """Run *cmd* (shell) inside the worktree and return the result."""
+        if not self.eval_cwd.exists():
+            msg = (
+                f"eval_cwd does not exist: {self.eval_cwd}. "
+                f"worktree_path={self.worktree_path}. "
+                "The git worktree may not have checked out the expected subdir, "
+                "or the CodeAgent may have deleted it."
+            )
+            logger.error(msg)
+            return EvalResult(
+                returncode=-1,
+                stdout="",
+                stderr=msg,
+                elapsed_sec=0.0,
+            )
         t0 = time.monotonic()
         try:
             r = subprocess.run(
                 cmd,
                 shell=True,
-                cwd=str(self.worktree_path),
+                cwd=str(self.eval_cwd),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
