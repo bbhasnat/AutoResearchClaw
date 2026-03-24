@@ -290,6 +290,28 @@ class HypothesisWorktree:
             )
 
         self.worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Remove stale worktree from a previous run at the same path.
+        # This happens when a hypothesis is re-run after an earlier failure.
+        if self.worktree_path.exists():
+            logger.info(
+                "Removing stale worktree at %s before re-creating",
+                self.worktree_path,
+            )
+            remove_result = self._run_git(
+                ["worktree", "remove", "--force", str(self.worktree_path)],
+                cwd=self.repo_path,
+            )
+            if remove_result is None or remove_result.returncode != 0:
+                # git worktree remove failed — try pruning and removing dir
+                logger.warning(
+                    "git worktree remove failed (%s), pruning and removing dir",
+                    remove_result.stderr if remove_result else "unknown",
+                )
+                self._run_git(["worktree", "prune"], cwd=self.repo_path)
+                import shutil
+                shutil.rmtree(self.worktree_path, ignore_errors=True)
+
         result = self._run_git(
             ["worktree", "add", "--detach", str(self.worktree_path)],
             cwd=self.repo_path,

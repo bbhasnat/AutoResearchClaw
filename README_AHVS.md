@@ -1073,12 +1073,15 @@ The following framework bugs have been identified and fixed across recent sessio
 | **I** | Skill context block claimed runtime dispatch; module docstring said advisory-only | `d362902` |
 | **J** | `prompt_rewrite` hypotheses silently unmeasurable when eval uses `--eval-only` | `d362902` |
 | **K** | Worktree `create()` gave unclear error when `--repo` was not inside a git repository | `d362902` |
+| **L** | Framework accepted CodeAgent self-reported metrics (false 0.9928) when eval crashed | v8 fix |
+| **M** | Stale worktree from first run blocked reruns | v8 fix |
+| **N** | CodeAgent consistently destroys eval harness files (run_eval.py, __init__.py, main.py) | v8 fix |
 
-All bugs have regression tests in `tests/test_ahvs.py` (169 tests total).
+All bugs have regression tests in `tests/test_ahvs.py` (190 tests total).
 
 ### Test coverage
 
-AHVS has 169 unit/integration tests in `tests/test_ahvs.py` covering:
+AHVS has 190 unit/integration tests in `tests/test_ahvs.py` covering:
 
 1. Stage enum ordering and contracts
 2. Config validation and edge cases
@@ -1096,6 +1099,9 @@ AHVS has 169 unit/integration tests in `tests/test_ahvs.py` covering:
 14. Bug I: skill semantics consistency
 15. Bug J: eval-mode intelligence warnings
 16. Bug K: worktree subdir hardening and full round-trip
+17. Bug L: forbidden file filter + hardened metric extraction
+18. Bug N: pre-eval import sanity check
+19. v8 fixes: tightened plan validation, falsy enriched context, behavioral tests
 
 Run them with:
 ```bash

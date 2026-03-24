@@ -171,7 +171,7 @@ def load_context_bundle(
         "prior_experiments",
         "notes",
     ):
-        if field in baseline and baseline[field]:
+        if field in baseline and baseline[field] is not None:
             enriched_fields[field] = baseline[field]
 
     return {

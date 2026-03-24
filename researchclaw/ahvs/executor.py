@@ -212,6 +212,94 @@ _TYPE_EXECUTION_STRATEGIES: dict[str, dict[str, str]] = {
 
 
 # ---------------------------------------------------------------------------
+# Forbidden file patterns — eval-harness protection
+# ---------------------------------------------------------------------------
+
+# Basenames that CodeAgent is NOT allowed to write to the worktree.
+# These are eval-harness infrastructure files.  Modifying them consistently
+# breaks the eval pipeline (circular imports, broken argparse, missing entry
+# points).  The prompt tells CodeAgent not to touch them; this filter
+# enforces it at the framework level.
+_FORBIDDEN_BASENAMES: frozenset[str] = frozenset({
+    "run_eval.py",
+    "__init__.py",
+    "evaluation.py",
+    "main.py",
+})
+
+# Patterns for files that are always standalone scripts / test files
+# and should never be applied to the worktree.
+_FORBIDDEN_PREFIXES: tuple[str, ...] = ("test_", "tests_")
+_FORBIDDEN_SUFFIXES: tuple[str, ...] = ("_test.py",)
+
+
+def _is_forbidden_file(relpath: str) -> str | None:
+    """Return a reason string if *relpath* is a forbidden file, else None."""
+    from pathlib import PurePosixPath
+
+    basename = PurePosixPath(relpath).name
+
+    if basename in _FORBIDDEN_BASENAMES:
+        return f"forbidden eval-harness file: {basename}"
+
+    if any(basename.startswith(p) for p in _FORBIDDEN_PREFIXES):
+        return f"test file not allowed in worktree: {basename}"
+
+    if any(basename.endswith(s) for s in _FORBIDDEN_SUFFIXES):
+        return f"test file not allowed in worktree: {basename}"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pre-eval import sanity check
+# ---------------------------------------------------------------------------
+
+
+def _run_import_sanity_check(
+    worktree: "HypothesisWorktree",
+    eval_command: str,
+) -> str | None:
+    """Verify key modules can still import after CodeAgent changes.
+
+    Parses the eval_command to find the Python module being invoked
+    (e.g. ``python -m autoqa.run_eval`` → ``autoqa.run_eval``) and
+    attempts to import it in the worktree.
+
+    Returns None if the check passes, or an error string if it fails.
+    """
+    # Extract module name from "-m <module>" in eval_command
+    import shlex
+
+    try:
+        parts = shlex.split(eval_command)
+    except ValueError:
+        parts = eval_command.split()
+
+    module_name = None
+    for i, part in enumerate(parts):
+        if part == "-m" and i + 1 < len(parts):
+            module_name = parts[i + 1]
+            break
+
+    if module_name is None:
+        return None  # Can't determine module — skip check
+
+    # Try importing the module in the worktree
+    check_cmd = (
+        f"PYTHONPATH=src:$PYTHONPATH {parts[0]} -c "
+        f"'import {module_name}; print(\"import OK\")'"
+    )
+    result = worktree.run_eval_command(check_cmd, timeout=30)
+    if result.returncode != 0:
+        return (
+            f"import {module_name} failed in worktree after applying "
+            f"CodeAgent changes. stderr: {result.stderr[:300]}"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Parsing helpers — structured JSON primary, markdown/regex fallback
 # ---------------------------------------------------------------------------
 
@@ -221,8 +309,9 @@ _HYPOTHESIS_ALL_FIELDS = {
     "id", "type", "description", "rationale", "estimated_cost", "required_tools",
 }
 
-# Required fields for each validation plan dict
-_PLAN_REQUIRED_FIELDS = {"id"}
+# Required fields for each validation plan dict — require core execution
+# fields so a bare {"id": "H1"} doesn't suppress a valid markdown fallback
+_PLAN_REQUIRED_FIELDS = {"id", "implementation_approach", "eval_method"}
 _PLAN_ALL_FIELDS = {
     "id", "implementation_approach", "eval_method", "skill",
     "success_criterion", "expected_artifacts",
@@ -1194,6 +1283,18 @@ def _run_single_hypothesis(
         f"Do NOT create standalone scripts (main.py, config.py, evaluation.py, etc.).\n"
         f"The eval_command runs the EXISTING pipeline — only changes to existing\n"
         f"source files will be picked up. New standalone files are NEVER executed.\n\n"
+        f"## FORBIDDEN FILES — DO NOT TOUCH\n"
+        f"The following files are part of the eval harness infrastructure.\n"
+        f"**You MUST NOT modify, rewrite, or recreate any of these files.**\n"
+        f"Modifying them will break the eval pipeline and your hypothesis will\n"
+        f"score zero. The framework will automatically reject any changes to these:\n"
+        f"- `run_eval.py` or any file matching `**/run_eval.py` (eval entry point)\n"
+        f"- `__init__.py` (package structure)\n"
+        f"- `evaluation.py` or any file matching `**/evaluation.py`\n"
+        f"- `main.py` (standalone script — never executed by eval)\n"
+        f"- Any file matching `test_*.py` or `*_test.py` (test files)\n\n"
+        f"If you need to change how evaluation works, modify the **processing logic**\n"
+        f"(parsing, prompts, config) — NOT the eval harness itself.\n\n"
         f"When generating files, use the EXACT relative path of the existing file\n"
         f"you want to modify (e.g. `src/autoqa/parsing.py`, not `parsing.py` or\n"
         f"`my_parsing_fix.py`).\n\n"
@@ -1381,13 +1482,34 @@ def _run_single_hypothesis(
             fpath.write_text(content, encoding="utf-8")
             artifact_paths.append(str(fpath.relative_to(cycle_dir)))
 
+        # ── Filter forbidden files ─────────────────────────────────
+        # Reject eval-harness files and standalone scripts BEFORE
+        # syntax checking or worktree application.  This is enforced at
+        # the framework level because CodeAgent consistently ignores
+        # prompt instructions not to touch these files.
+        filtered_files: dict[str, str] = {}
+        for filename, content in agent_result.files.items():
+            reason = _is_forbidden_file(filename)
+            if reason is not None:
+                logger.warning(
+                    "%s: BLOCKED %s from worktree apply — %s",
+                    hyp_id, filename, reason,
+                )
+            else:
+                filtered_files[filename] = content
+
+        if len(filtered_files) < len(agent_result.files):
+            blocked_count = len(agent_result.files) - len(filtered_files)
+            print(
+                f"[AHVS] {hyp_id}: blocked {blocked_count} forbidden file(s) "
+                f"from worktree apply (eval-harness protection)"
+            )
+
         # Filter out syntactically invalid Python files before applying to
         # worktree — the CodeAgent may return truncated output that passed
         # hard_validation's max-repair limit.
-        # NOTE: In splice mode, partial output is valid Python fragments
-        # (individual functions/classes) so we still validate syntax.
         valid_files = {}
-        for filename, content in agent_result.files.items():
+        for filename, content in filtered_files.items():
             if filename.endswith(".py"):
                 try:
                     compile(content, filename, "exec")
@@ -1407,7 +1529,29 @@ def _run_single_hypothesis(
         if worktree is not None and valid_files:
             worktree.apply_files(valid_files, splice=True)
 
-        # ── Five-tier metric extraction ──────────────────────────────
+        # ── Pre-eval import sanity check ──────────────────────────────
+        # After applying files, verify the eval module can still import.
+        # If CodeAgent broke imports (circular, missing, syntax in spliced
+        # file), fail early with a clear message instead of a cryptic eval
+        # crash.
+        if worktree is not None and eval_command:
+            import_err = _run_import_sanity_check(worktree, eval_command)
+            if import_err is not None:
+                logger.error(
+                    "%s: PRE-EVAL IMPORT CHECK FAILED — %s. "
+                    "CodeAgent changes broke the module structure.",
+                    hyp_id, import_err,
+                )
+                print(
+                    f"[AHVS] {hyp_id}: pre-eval import check FAILED — "
+                    f"CodeAgent changes broke module imports. "
+                    f"Skipping eval_command."
+                )
+                # Mark as extraction_failed — don't run eval on broken code
+                measurement_status = "extraction_failed"
+                error = f"Pre-eval import check failed: {import_err}"
+
+        # ── Metric extraction ──────────────────────────────────────────
 
         # Warn if prompt_rewrite uses --eval-only (prompt changes need re-inference)
         if hyp_type == "prompt_rewrite" and eval_command and "--eval-only" in eval_command:
@@ -1419,9 +1563,16 @@ def _run_single_hypothesis(
                 hyp_id,
             )
 
-        # Tier 0 (NEW): eval_command in worktree
+        # When eval_command is configured, it is the ONLY trusted measurement
+        # source.  Tiers 1-3 (sandbox self-reports) are unconditionally
+        # skipped because CodeAgent can fabricate result.json with false
+        # metrics (Bug L: false 0.9928 precision when eval actually crashed).
+        eval_command_is_authoritative = bool(eval_command)
+
+        # Tier 0: eval_command in worktree (the only trusted source)
         if (
             measurement_status != "measured"
+            and measurement_status != "extraction_failed"
             and eval_command
             and worktree is not None
         ):
@@ -1438,50 +1589,61 @@ def _run_single_hypothesis(
                     )
             else:
                 logger.warning(
-                    "%s: eval_command exited %d — falling through to sandbox tiers. "
+                    "%s: eval_command exited %d — marking extraction_failed. "
                     "stderr: %s",
                     hyp_id, eval_result.returncode,
                     eval_result.stderr[:300],
                 )
 
-        # Tier 1: result.json in work_dir
-        result_json_path = work_dir / "result.json"
-        if not result_json_path.exists():
-            # Tier 1b: result.json in agent_runs subdirectories (sandbox copy-back)
-            for candidate in sorted(work_dir.glob("agent_runs/*/result.json")):
-                result_json_path = candidate
-                break
+        # Tiers 1-3: Sandbox self-reports — ONLY used when no eval_command
+        # is configured.  When eval_command exists, these are unconditionally
+        # skipped to prevent CodeAgent from fabricating metrics.
+        if not eval_command_is_authoritative:
+            # Tier 1: result.json in work_dir
+            result_json_path = work_dir / "result.json"
+            if not result_json_path.exists():
+                for candidate in sorted(work_dir.glob("agent_runs/*/result.json")):
+                    result_json_path = candidate
+                    break
 
-        if measurement_status != "measured" and result_json_path.exists():
-            raw = result_json_path.read_text(encoding="utf-8")
-            extracted = _extract_metric_from_output(raw, metric_name)
-            if extracted is not None:
-                metric_value = extracted
-                measurement_status = "measured"
+            if measurement_status != "measured" and result_json_path.exists():
+                raw = result_json_path.read_text(encoding="utf-8")
+                extracted = _extract_metric_from_output(raw, metric_name)
+                if extracted is not None:
+                    metric_value = extracted
+                    measurement_status = "measured"
 
-        # Tier 2: Direct from sandbox-parsed metrics
-        if measurement_status != "measured" and agent_result.best_metrics:
-            val = agent_result.best_metrics.get(metric_name)
-            if isinstance(val, (int, float)):
-                metric_value = float(val)
-                measurement_status = "measured"
+            # Tier 2: Direct from sandbox-parsed metrics
+            if measurement_status != "measured" and agent_result.best_metrics:
+                val = agent_result.best_metrics.get(metric_name)
+                if isinstance(val, (int, float)):
+                    metric_value = float(val)
+                    measurement_status = "measured"
 
-        # Tier 3: Parse raw sandbox stdout
-        if measurement_status != "measured" and agent_result.best_stdout:
-            extracted = _extract_metric_from_output(agent_result.best_stdout, metric_name)
-            if extracted is not None:
-                metric_value = extracted
-                measurement_status = "measured"
+            # Tier 3: Parse raw sandbox stdout
+            if measurement_status != "measured" and agent_result.best_stdout:
+                extracted = _extract_metric_from_output(agent_result.best_stdout, metric_name)
+                if extracted is not None:
+                    metric_value = extracted
+                    measurement_status = "measured"
 
         # Tier 4: Extraction failed — log warning, keep baseline
         if measurement_status != "measured":
             measurement_status = "extraction_failed"
-            logger.warning(
-                "%s: metric extraction failed across all sources — "
-                "metric_value remains at baseline (%.4f). "
-                "Hypothesis code may not have produced output.",
-                hyp_id, baseline_value,
-            )
+            if eval_command_is_authoritative:
+                logger.warning(
+                    "%s: eval_command did not produce a valid metric — "
+                    "metric_value remains at baseline (%.4f). "
+                    "Sandbox self-reports are NOT used when eval_command is configured.",
+                    hyp_id, baseline_value,
+                )
+            else:
+                logger.warning(
+                    "%s: metric extraction failed across all sources — "
+                    "metric_value remains at baseline (%.4f). "
+                    "Hypothesis code may not have produced output.",
+                    hyp_id, baseline_value,
+                )
 
     except Exception as exc:  # noqa: BLE001
         error = f"CodeAgent execution failed: {exc}"

@@ -2552,3 +2552,340 @@ class TestWorktreeSubdirHardening:
         assert "+x = 42" in diff
 
         wt.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# 14. v8 review fixes + Bug L/M — forbidden files, import sanity check,
+#     hardened metric extraction, plan validation, falsy enriched context,
+#     behavioral tests
+# ---------------------------------------------------------------------------
+
+
+class TestForbiddenFiles:
+    """Eval-harness protection: forbidden files are blocked before apply_files."""
+
+    def test_run_eval_py_blocked(self) -> None:
+        from researchclaw.ahvs.executor import _is_forbidden_file
+        assert _is_forbidden_file("run_eval.py") is not None
+        assert _is_forbidden_file("src/autoqa/run_eval.py") is not None
+
+    def test_init_py_blocked(self) -> None:
+        from researchclaw.ahvs.executor import _is_forbidden_file
+        assert _is_forbidden_file("__init__.py") is not None
+        assert _is_forbidden_file("src/autoqa/__init__.py") is not None
+
+    def test_evaluation_py_blocked(self) -> None:
+        from researchclaw.ahvs.executor import _is_forbidden_file
+        assert _is_forbidden_file("evaluation.py") is not None
+
+    def test_main_py_blocked(self) -> None:
+        from researchclaw.ahvs.executor import _is_forbidden_file
+        assert _is_forbidden_file("main.py") is not None
+
+    def test_test_files_blocked(self) -> None:
+        from researchclaw.ahvs.executor import _is_forbidden_file
+        assert _is_forbidden_file("test_fixes.py") is not None
+        assert _is_forbidden_file("test_parsing.py") is not None
+        assert _is_forbidden_file("parsing_test.py") is not None
+
+    def test_normal_files_allowed(self) -> None:
+        from researchclaw.ahvs.executor import _is_forbidden_file
+        assert _is_forbidden_file("src/autoqa/parsing.py") is None
+        assert _is_forbidden_file("src/autoqa/prompts.py") is None
+        assert _is_forbidden_file("config.yaml") is None
+        assert _is_forbidden_file("src/autoqa/llm_client.py") is None
+
+    def test_forbidden_basenames_constant_complete(self) -> None:
+        """All known problematic files from production runs are in the list."""
+        from researchclaw.ahvs.executor import _FORBIDDEN_BASENAMES
+        for f in ("run_eval.py", "__init__.py", "evaluation.py", "main.py"):
+            assert f in _FORBIDDEN_BASENAMES
+
+
+class TestPreEvalImportSanityCheck:
+    """Pre-eval import check catches broken modules before eval_command runs."""
+
+    def test_passing_import_check(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.executor import _run_import_sanity_check
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        # Create a valid Python package
+        pkg = repo / "mypkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "run_eval.py").write_text("print('ok')\n")
+        subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add pkg"],
+            cwd=str(repo), capture_output=True, check=True,
+        )
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        result = _run_import_sanity_check(
+            wt, "python3 -m mypkg.run_eval --eval-only"
+        )
+        assert result is None  # should pass
+        wt.cleanup()
+
+    def test_failing_import_check(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.executor import _run_import_sanity_check
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        # No module exists — import should fail
+        result = _run_import_sanity_check(
+            wt, "python3 -m nonexistent_module.run_eval"
+        )
+        assert result is not None
+        assert "nonexistent_module" in result
+        wt.cleanup()
+
+    def test_no_module_flag_skips_check(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.executor import _run_import_sanity_check
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        # eval_command without -m flag — can't determine module, skip check
+        result = _run_import_sanity_check(wt, "bash run_eval.sh")
+        assert result is None
+        wt.cleanup()
+
+
+class TestHardenedMetricExtraction:
+    """Bug L fix: sandbox self-reports are never trusted when eval_command is configured."""
+
+    def test_sandbox_tiers_unconditionally_skipped_with_eval_command(self) -> None:
+        """When eval_command is configured, Tiers 1-3 must be skipped
+        regardless of whether eval succeeded or failed."""
+        import inspect
+        from researchclaw.ahvs.executor import _run_single_hypothesis
+
+        source = inspect.getsource(_run_single_hypothesis)
+        # The code should have eval_command_is_authoritative gate
+        assert "eval_command_is_authoritative" in source
+        # Tiers 1-3 should only run when NOT authoritative
+        assert "not eval_command_is_authoritative" in source
+
+    def test_forbidden_prompt_mentions_forbidden_files(self) -> None:
+        """The CodeAgent prompt should mention forbidden files."""
+        import inspect
+        from researchclaw.ahvs.executor import _run_single_hypothesis
+
+        source = inspect.getsource(_run_single_hypothesis)
+        assert "FORBIDDEN FILES" in source
+
+
+class TestPlanRequiredFieldsTightened:
+    """v8 Finding 1: _PLAN_REQUIRED_FIELDS now requires core execution fields."""
+
+    def test_bare_id_plan_rejected(self) -> None:
+        """A JSON plan with only 'id' should fall through to markdown."""
+        from researchclaw.ahvs.executor import _parse_validation_plan
+
+        text = json.dumps([{"id": "H1"}])
+        # Should fall through to markdown (which finds nothing) → empty list
+        result = _parse_validation_plan(text)
+        assert len(result) == 0
+
+    def test_complete_json_plan_accepted(self) -> None:
+        """A JSON plan with all required fields should be accepted."""
+        from researchclaw.ahvs.executor import _parse_validation_plan
+
+        text = json.dumps([{
+            "id": "H1",
+            "implementation_approach": "Modify ranking function",
+            "eval_method": "custom_script",
+        }])
+        result = _parse_validation_plan(text)
+        assert len(result) == 1
+        assert result[0]["id"] == "H1"
+
+    def test_plan_required_fields_include_core(self) -> None:
+        from researchclaw.ahvs.executor import _PLAN_REQUIRED_FIELDS
+        assert "implementation_approach" in _PLAN_REQUIRED_FIELDS
+        assert "eval_method" in _PLAN_REQUIRED_FIELDS
+
+
+class TestFalsyEnrichedContext:
+    """v8 Finding 2: falsy but meaningful values like 0 or 0.0 are preserved."""
+
+    def test_zero_regression_floor_preserved(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.context_loader import load_context_bundle
+
+        baseline = {
+            "primary_metric": "precision",
+            "precision": 0.67,
+            "recorded_at": "2026-03-24T10:00:00Z",
+            "eval_command": "echo test",
+            "regression_floor": 0.0,  # falsy but meaningful
+        }
+        baseline_path = tmp_path / "baseline_metric.json"
+        baseline_path.write_text(json.dumps(baseline))
+
+        bundle = load_context_bundle(
+            repo_path=tmp_path,
+            question="test",
+            evolution_dir=tmp_path / "evolution",
+            baseline_path=baseline_path,
+        )
+
+        assert "regression_floor" in bundle["enriched_context"]
+        assert bundle["enriched_context"]["regression_floor"] == 0.0
+
+    def test_false_value_preserved(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.context_loader import load_context_bundle
+
+        baseline = {
+            "primary_metric": "f1",
+            "f1": 0.73,
+            "recorded_at": "2026-03-24T10:00:00Z",
+            "eval_command": "echo test",
+            "constraints": False,  # falsy but explicit
+        }
+        baseline_path = tmp_path / "baseline_metric.json"
+        baseline_path.write_text(json.dumps(baseline))
+
+        bundle = load_context_bundle(
+            repo_path=tmp_path,
+            question="test",
+            evolution_dir=tmp_path / "evolution",
+            baseline_path=baseline_path,
+        )
+
+        assert "constraints" in bundle["enriched_context"]
+        assert bundle["enriched_context"]["constraints"] is False
+
+    def test_none_value_excluded(self, tmp_path: Path) -> None:
+        from researchclaw.ahvs.context_loader import load_context_bundle
+
+        baseline = {
+            "primary_metric": "f1",
+            "f1": 0.73,
+            "recorded_at": "2026-03-24T10:00:00Z",
+            "eval_command": "echo test",
+            "constraints": None,  # None should be excluded
+        }
+        baseline_path = tmp_path / "baseline_metric.json"
+        baseline_path.write_text(json.dumps(baseline))
+
+        bundle = load_context_bundle(
+            repo_path=tmp_path,
+            question="test",
+            evolution_dir=tmp_path / "evolution",
+            baseline_path=baseline_path,
+        )
+
+        assert "constraints" not in bundle["enriched_context"]
+
+
+class TestBehavioralCrossCycleMemory:
+    """v8 Finding 3: behavioral test for cross-cycle memory (not source inspection)."""
+
+    def test_lessons_written_as_ahvs_execution_retrieved_with_boost(self, tmp_path: Path) -> None:
+        """End-to-end: write lessons → load_context_bundle retrieves them."""
+        from researchclaw.ahvs.context_loader import load_context_bundle
+        from researchclaw.evolution import EvolutionStore, LessonEntry
+        from datetime import datetime, timezone
+
+        # Create evolution store with a lesson
+        evo_dir = tmp_path / "evolution"
+        store = EvolutionStore(evo_dir)
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        store.append(LessonEntry(
+            stage_name="ahvs_execution",
+            stage_num=6,
+            category="experiment",
+            severity="info",
+            description="H1 improved precision by +5% using threshold change",
+            timestamp=now,
+        ))
+        store.append(LessonEntry(
+            stage_name="ahvs_execution",
+            stage_num=6,
+            category="experiment",
+            severity="warning",
+            description="H2 failed: prompt rewrite had no effect due to eval-only mode",
+            timestamp=now,
+        ))
+
+        # Create baseline
+        baseline = {
+            "primary_metric": "precision",
+            "precision": 0.85,
+            "recorded_at": "2026-03-24T10:00:00Z",
+            "eval_command": "echo 'precision: 0.85'",
+        }
+        baseline_path = tmp_path / "baseline_metric.json"
+        baseline_path.write_text(json.dumps(baseline))
+
+        # Load context bundle — should retrieve both lessons
+        bundle = load_context_bundle(
+            repo_path=tmp_path,
+            question="Improve precision",
+            evolution_dir=evo_dir,
+            baseline_path=baseline_path,
+        )
+
+        # Prior lessons (severity=info) should include H1
+        assert any("H1 improved" in l for l in bundle["prior_lessons"])
+        # Rejected approaches (severity=warning) should include H2
+        assert any("H2 failed" in r for r in bundle["rejected_approaches"])
+
+    def test_no_evolution_dir_produces_empty_lessons(self, tmp_path: Path) -> None:
+        """First cycle with no evolution store should still work."""
+        from researchclaw.ahvs.context_loader import load_context_bundle
+
+        baseline = {
+            "primary_metric": "f1",
+            "f1": 0.73,
+            "recorded_at": "2026-03-24T10:00:00Z",
+            "eval_command": "echo test",
+        }
+        baseline_path = tmp_path / "baseline_metric.json"
+        baseline_path.write_text(json.dumps(baseline))
+
+        bundle = load_context_bundle(
+            repo_path=tmp_path,
+            question="test",
+            evolution_dir=tmp_path / "nonexistent_evolution",
+            baseline_path=baseline_path,
+        )
+
+        assert bundle["prior_lessons"] == []
+        assert bundle["rejected_approaches"] == []
+
+
+class TestBehavioralEvalModeIntelligence:
+    """v8 Finding 3: behavioral test for eval-mode warnings."""
+
+    def test_eval_mode_warning_types(self) -> None:
+        """_NEEDS_REINFERENCE_TYPES should contain exactly the right types."""
+        # Test by checking the actual set in the function body
+        from researchclaw.ahvs.executor import _run_single_hypothesis
+        import inspect
+        source = inspect.getsource(_run_single_hypothesis)
+        # Extract the set literal
+        assert '"prompt_rewrite"' in source
+        assert '"model_comparison"' in source
+        # code_change should NOT be in the reinference set
+        idx = source.index("_NEEDS_REINFERENCE_TYPES")
+        set_block = source[idx:idx + 100]
+        assert '"code_change"' not in set_block

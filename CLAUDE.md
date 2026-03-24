@@ -34,8 +34,11 @@ This repo is built on the principle that **lessons survive sessions**. The entir
 - **Bug I** ✅ FIXED (`d362902`): Skill semantics made consistently advisory (code + docs)
 - **Bug J** ✅ FIXED (`d362902`): Eval-mode intelligence warns when prompt_rewrite meets --eval-only
 - **Bug K** ✅ FIXED (`d362902`): Worktree subdir handling hardened with clear diagnostics
+- **Bug L** ✅ FIXED: Framework accepted CodeAgent self-reported metrics (false 0.9928 precision) when eval crashed — sandbox Tiers 1-3 now unconditionally skipped when eval_command is configured
+- **Bug M** ✅ FIXED: Stale worktree from first run blocked reruns — `create()` now removes stale worktrees before re-creating
+- **Bug N** ✅ FIXED: CodeAgent consistently destroys eval harness (run_eval.py, __init__.py, main.py) — forbidden file filter enforced at framework level + pre-eval import sanity check added
 
-### Ready to run next AHVS cycle (all blockers resolved, 169 tests passing)
+### Ready to run next AHVS cycle (all blockers resolved, 190 tests passing)
 
 ## AHVS Launch Command
 ```bash
