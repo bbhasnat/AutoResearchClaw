@@ -149,11 +149,31 @@ def load_context_bundle(
     if evolution_dir.exists():
         try:
             store = EvolutionStore(evolution_dir)
-            lessons = store.query_for_stage("ahvs_hypothesis_gen", max_lessons=12)
+            # Query with "ahvs_execution" — this is the stage_name used when
+            # writing lessons at Stage 7 (report/memory).  Using the same name
+            # ensures the EvolutionStore 2x boost applies to direct matches,
+            # giving cross-cycle lessons proper retrieval priority.
+            lessons = store.query_for_stage("ahvs_execution", max_lessons=12)
         except Exception:  # noqa: BLE001
             pass  # Non-fatal — first cycle has no history
 
     metric_key = baseline["primary_metric"]
+
+    # Forward enriched onboarding fields from baseline_metric.json.
+    # These fields are documented in README_AHVS.md and improve hypothesis
+    # quality by giving the LLM richer operator intent context.
+    enriched_fields = {}
+    for field in (
+        "optimization_goal",
+        "regression_floor",
+        "constraints",
+        "system_levers",
+        "prior_experiments",
+        "notes",
+    ):
+        if field in baseline and baseline[field]:
+            enriched_fields[field] = baseline[field]
+
     return {
         "question": question,
         "baseline": {
@@ -163,6 +183,7 @@ def load_context_bundle(
             "recorded_at": baseline.get("recorded_at", ""),
             "commit": baseline.get("commit", ""),
         },
+        "enriched_context": enriched_fields,
         "prior_lessons": _extract_prior_lessons(lessons),
         "rejected_approaches": _extract_rejected_approaches(lessons),
         "domain_tags": _infer_domain_tags(repo_path),

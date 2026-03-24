@@ -212,16 +212,111 @@ _TYPE_EXECUTION_STRATEGIES: dict[str, dict[str, str]] = {
 
 
 # ---------------------------------------------------------------------------
-# Parsing helpers
+# Parsing helpers — structured JSON primary, markdown/regex fallback
 # ---------------------------------------------------------------------------
+
+# Required fields for each hypothesis dict
+_HYPOTHESIS_REQUIRED_FIELDS = {"id", "type", "description"}
+_HYPOTHESIS_ALL_FIELDS = {
+    "id", "type", "description", "rationale", "estimated_cost", "required_tools",
+}
+
+# Required fields for each validation plan dict
+_PLAN_REQUIRED_FIELDS = {"id"}
+_PLAN_ALL_FIELDS = {
+    "id", "implementation_approach", "eval_method", "skill",
+    "success_criterion", "expected_artifacts",
+}
+
+
+def _try_parse_json_block(text: str) -> list[dict] | dict | None:
+    """Try to extract and parse a JSON array or object from *text*.
+
+    Looks for ```json fenced blocks first, then bare [...] or {...} blocks.
+    Returns None if no valid JSON is found.
+    """
+    # Try fenced code blocks first
+    fenced = re.search(r"```(?:json)?\s*\n([\s\S]*?)\n```", text)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Try to parse the first top-level JSON structure.
+    # We look for the first [ or { and try to parse from there.
+    # This correctly handles both `[{...}]` arrays and `{...}` objects.
+    stripped = text.strip()
+    for i, ch in enumerate(stripped):
+        if ch in ("[", "{"):
+            try:
+                return json.loads(stripped[i:])
+            except json.JSONDecodeError:
+                # Try to find matching bracket by working backwards
+                close = "]" if ch == "[" else "}"
+                for j in range(len(stripped) - 1, i, -1):
+                    if stripped[j] == close:
+                        try:
+                            return json.loads(stripped[i:j + 1])
+                        except json.JSONDecodeError:
+                            continue
+                break  # Only try the first JSON-starting character
+    return None
+
+
+def _validate_hypothesis(hyp: dict) -> dict | None:
+    """Validate and normalise a single hypothesis dict from JSON.
+
+    Returns the normalised dict, or None if required fields are missing.
+    """
+    if not isinstance(hyp, dict):
+        return None
+    if not all(hyp.get(f) for f in _HYPOTHESIS_REQUIRED_FIELDS):
+        return None
+    # Normalise required_tools to list
+    rt = hyp.get("required_tools", [])
+    if isinstance(rt, str):
+        hyp["required_tools"] = [t.strip() for t in rt.split(",") if t.strip()]
+    elif not isinstance(rt, list):
+        hyp["required_tools"] = []
+    # Ensure all expected fields exist with defaults
+    for f in _HYPOTHESIS_ALL_FIELDS:
+        hyp.setdefault(f, "" if f != "required_tools" else [])
+    return hyp
+
+
+def _validate_plan(plan: dict) -> dict | None:
+    """Validate and normalise a single validation plan dict from JSON."""
+    if not isinstance(plan, dict):
+        return None
+    if not all(plan.get(f) for f in _PLAN_REQUIRED_FIELDS):
+        return None
+    for f in _PLAN_ALL_FIELDS:
+        plan.setdefault(f, "")
+    return plan
 
 
 def _parse_hypotheses(text: str) -> list[dict]:
-    """Parse hypotheses.md into a list of hypothesis dicts."""
+    """Parse hypotheses from LLM output.
+
+    Tries structured JSON first (array of hypothesis objects), then falls
+    back to the markdown/regex parser for backward compatibility.
+    """
+    # --- JSON path ---
+    parsed = _try_parse_json_block(text)
+    if isinstance(parsed, list) and parsed:
+        results = []
+        for item in parsed:
+            validated = _validate_hypothesis(item)
+            if validated is not None:
+                results.append(validated)
+        if results:
+            logger.debug("Parsed %d hypotheses via JSON path", len(results))
+            return results
+
+    # --- Markdown/regex fallback ---
     hypotheses = []
-    # Split on H1, H2, ... headers
     blocks = re.split(r"^##\s+(H\d+)\s*$", text, flags=re.MULTILINE)
-    # blocks: ['preamble', 'H1', 'H1 body', 'H2', 'H2 body', ...]
     it = iter(blocks)
     next(it, None)  # skip preamble
     for hyp_id, body in zip(it, it):
@@ -243,17 +338,47 @@ def _parse_hypotheses(text: str) -> list[dict]:
 
 
 def _parse_selection(text: str) -> dict:
-    """Parse selection.md → {selected: [H1, H2], rationale: str}."""
-    selected: list[str] = re.findall(r"\bH\d+\b", text)
+    """Parse selection from LLM output.
+
+    Tries JSON first, then markdown/regex fallback.
+    """
+    # --- JSON path ---
+    parsed = _try_parse_json_block(text)
+    if isinstance(parsed, dict) and "selected" in parsed:
+        selected = parsed["selected"]
+        if isinstance(selected, list):
+            return {
+                "selected": list(dict.fromkeys(s for s in selected if isinstance(s, str))),
+                "rationale": str(parsed.get("rationale", "")),
+            }
+
+    # --- Markdown/regex fallback ---
+    selected_ids: list[str] = re.findall(r"\bH\d+\b", text)
     rationale_m = re.search(r"\*\*Rationale:\*\*\s*(.+)", text, re.IGNORECASE)
     return {
-        "selected": list(dict.fromkeys(selected)),  # dedup, preserve order
+        "selected": list(dict.fromkeys(selected_ids)),
         "rationale": rationale_m.group(1).strip() if rationale_m else "",
     }
 
 
 def _parse_validation_plan(text: str) -> list[dict]:
-    """Parse validation_plan.md into per-hypothesis plan dicts."""
+    """Parse validation plan from LLM output.
+
+    Tries JSON first, then markdown/regex fallback.
+    """
+    # --- JSON path ---
+    parsed = _try_parse_json_block(text)
+    if isinstance(parsed, list) and parsed:
+        results = []
+        for item in parsed:
+            validated = _validate_plan(item)
+            if validated is not None:
+                results.append(validated)
+        if results:
+            logger.debug("Parsed %d plans via JSON path", len(results))
+            return results
+
+    # --- Markdown/regex fallback ---
     plans = []
     blocks = re.split(r"^##\s+(H\d+)\s*$", text, flags=re.MULTILINE)
     it = iter(blocks)
@@ -492,6 +617,22 @@ def _execute_hypothesis_gen(
     )
     domain_tags_text = ", ".join(bundle.get("domain_tags", ["general"]))
 
+    # Format enriched onboarding context for the prompt
+    enriched = bundle.get("enriched_context", {})
+    if enriched:
+        enriched_lines = []
+        for key, val in enriched.items():
+            label = key.replace("_", " ").title()
+            if isinstance(val, list):
+                enriched_lines.append(f"- **{label}:** {', '.join(str(v) for v in val)}")
+            elif isinstance(val, dict):
+                enriched_lines.append(f"- **{label}:** {json.dumps(val)}")
+            else:
+                enriched_lines.append(f"- **{label}:** {val}")
+        enriched_context_text = "\n".join(enriched_lines)
+    else:
+        enriched_context_text = "No additional operator context provided."
+
     pm = AHVSPromptManager(config.prompts_override_path)
     prompt = pm.for_stage(
         "ahvs_hypothesis_gen",
@@ -500,6 +641,7 @@ def _execute_hypothesis_gen(
         baseline_value=str(baseline["value"]),
         eval_command=baseline.get("eval_command", ""),
         domain_tags=domain_tags_text,
+        enriched_context=enriched_context_text,
         prior_lessons=prior_lessons_text,
         rejected_approaches=rejected_text,
         max_hypotheses=str(config.max_hypotheses),
@@ -1139,6 +1281,28 @@ def _run_single_hypothesis(
         "multi_llm_judge": "openai anthropic",
     }
     pkg_hint = pkg_hint_map.get(hyp_type, "")
+
+    # ── Eval-mode intelligence ────────────────────────────────────────
+    # Detect when hypothesis type is incompatible with eval-only mode.
+    # prompt_rewrite and model_comparison change LLM behaviour, but if the
+    # eval command uses --eval-only it reads frozen checkpoint data and the
+    # changes will have zero measurable effect.
+    _NEEDS_REINFERENCE_TYPES = {"prompt_rewrite", "model_comparison"}
+    if hyp_type in _NEEDS_REINFERENCE_TYPES and "--eval-only" in eval_command:
+        logger.warning(
+            "%s: hypothesis type '%s' modifies LLM prompts/model, but eval "
+            "command uses --eval-only (reads frozen checkpoint data). "
+            "Changes will have NO measurable effect unless the eval pipeline "
+            "re-runs inference. Consider adding --reparse or removing "
+            "--eval-only for this hypothesis type.",
+            hyp_id, hyp_type,
+        )
+        # Add a visible warning to the print output
+        print(
+            f"[AHVS] WARNING: {hyp_id} ({hyp_type}) may be unmeasurable — "
+            f"eval command uses --eval-only which reads frozen data. "
+            f"Prompt/model changes require re-inference to take effect."
+        )
 
     t0 = time.monotonic()
     metric_value = baseline_value

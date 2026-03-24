@@ -225,8 +225,9 @@ class SkillLibrary:
             return ""
         lines = [
             "=== AVAILABLE AHVS SKILLS ===",
-            "You may reference these skills in your implementation plan.",
-            "AHVS will resolve skill invocations to actual tool calls at runtime.",
+            "These skills describe tools and patterns available in this environment.",
+            "Use them as guidance for your implementation — pick the right approach",
+            "for the hypothesis type and invoke the underlying tools directly in your code.",
             "",
         ]
         for skill in skills:

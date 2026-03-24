@@ -47,6 +47,7 @@
 ---
 
 ## 🔥 News
+- **[03/24/2026]** **AHVS (Adaptive Hypothesis Validation System)** — AutoResearchClaw now includes a dedicated 8-stage hypothesis-validation pipeline for iteratively improving LLM/RAG systems. Generate hypotheses, test them in isolated git worktrees, measure real metrics, and carry lessons forward across cycles. See [README_AHVS.md](README_AHVS.md) for details. `researchclaw ahvs --repo <path> --auto-approve`
 - **[03/17/2026]** [v0.3.0](https://github.com/aiming-lab/AutoResearchClaw/releases/tag/v0.3.0) — **MetaClaw Integration** — AutoResearchClaw now supports [MetaClaw](https://github.com/aiming-lab/MetaClaw) cross-run learning: pipeline failures → structured lessons → reusable skills, injected into all 23 stages. **+18.3%** robustness in controlled experiments. Opt-in (`metaclaw_bridge.enabled: true`), fully backward-compatible. See [Integration Guide](#-metaclaw-integration).
 - **[03/16/2026]** [v0.2.0](https://github.com/aiming-lab/AutoResearchClaw/releases/tag/v0.2.0) — Three multi-agent subsystems (CodeAgent, BenchmarkAgent, FigureAgent), hardened Docker sandbox with network-policy-aware execution, 4-round paper quality audit (AI-slop detection, 7-dim review scoring, NeurIPS checklist), and 15+ bug fixes from production runs.
 - **[03/15/2026]** [v0.1.0](https://github.com/aiming-lab/AutoResearchClaw/releases/tag/v0.1.0) — We release AutoResearchClaw: a fully autonomous 23-stage research pipeline that turns a single research idea into a conference-ready paper. No human intervention required.
@@ -81,6 +82,10 @@ Drop a research topic — get back a full academic paper with real literature fr
 </table>
 
 The pipeline runs **end-to-end without human intervention**. When experiments fail, it self-heals. When hypotheses don't hold, it pivots. When citations are fake, it kills them.
+
+### AHVS: Iterative LLM/RAG Optimisation
+
+Beyond paper writing, AutoResearchClaw includes **AHVS** (Adaptive Hypothesis Validation System) — an 8-stage cyclic pipeline that improves real LLM/RAG repositories through iterative hypothesis testing. Point it at any repo with an eval command, and AHVS will generate improvement hypotheses, test them in isolated git worktrees, measure real metrics, and carry lessons into future cycles. See [README_AHVS.md](README_AHVS.md).
 
 ---
 

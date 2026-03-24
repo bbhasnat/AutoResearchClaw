@@ -60,6 +60,7 @@ _AHVS_STAGES: dict[str, dict[str, Any]] = {
             "- Current value: {baseline_value}\n"
             "- Eval command: {eval_command}\n\n"
             "## Domain Tags\n{domain_tags}\n\n"
+            "## Operator Context\n{enriched_context}\n\n"
             "## Prior Lessons (from previous cycles)\n{prior_lessons}\n\n"
             "## Rejected Approaches (do not repeat these)\n{rejected_approaches}\n\n"
             "---\n\n"

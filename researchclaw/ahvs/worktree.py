@@ -250,7 +250,45 @@ class HypothesisWorktree:
     # ------------------------------------------------------------------
 
     def create(self) -> None:
-        """Create a detached worktree at repo HEAD."""
+        """Create a detached worktree at repo HEAD.
+
+        When ``repo_path`` is a subdirectory of the git root (e.g.
+        ``monorepo/autoqa``), the worktree is created at the git root level
+        and ``eval_cwd`` is set to the corresponding subdir inside the
+        worktree so that eval commands run from the correct directory.
+
+        Raises RuntimeError with a diagnostic message if the worktree cannot
+        be created or the expected subdir is missing after checkout.
+        """
+        # Determine git root *before* creating the worktree so we can give a
+        # clear diagnostic if repo_path is not inside a git repo.
+        git_root_result = self._run_git(
+            ["rev-parse", "--show-toplevel"],
+            cwd=self.repo_path,
+        )
+        if git_root_result is None or git_root_result.returncode != 0:
+            raise RuntimeError(
+                f"Cannot determine git root for repo_path={self.repo_path}. "
+                f"Is it inside a git repository?"
+            )
+        git_root = Path(git_root_result.stdout.strip()).resolve()
+        repo_resolved = self.repo_path.resolve()
+        is_subdir = repo_resolved != git_root
+        subdir = None
+
+        if is_subdir:
+            try:
+                subdir = repo_resolved.relative_to(git_root)
+            except ValueError:
+                raise RuntimeError(
+                    f"repo_path {repo_resolved} is not under git root {git_root}. "
+                    f"This should not happen — check your --repo argument."
+                )
+            logger.info(
+                "repo_path is a git subdir: git_root=%s, subdir=%s",
+                git_root, subdir,
+            )
+
         self.worktree_path.parent.mkdir(parents=True, exist_ok=True)
         result = self._run_git(
             ["worktree", "add", "--detach", str(self.worktree_path)],
@@ -262,24 +300,10 @@ class HypothesisWorktree:
         self._created = True
         logger.info("Created worktree at %s", self.worktree_path)
 
-        # Compute eval_cwd: if repo_path is a subdirectory of the git root,
-        # eval_command must run from the corresponding subdir in the worktree.
-        git_root_result = self._run_git(
-            ["rev-parse", "--show-toplevel"],
-            cwd=self.repo_path,
-        )
-        if git_root_result and git_root_result.returncode == 0:
-            git_root = Path(git_root_result.stdout.strip()).resolve()
-            repo_resolved = self.repo_path.resolve()
-            if repo_resolved != git_root:
-                try:
-                    subdir = repo_resolved.relative_to(git_root)
-                    self.eval_cwd = self.worktree_path / subdir
-                    logger.info(
-                        "repo_path is a git subdir; eval_cwd set to %s", self.eval_cwd
-                    )
-                except ValueError:
-                    pass  # repo_path not under git_root — use worktree root
+        # Set eval_cwd to the subdir within the worktree
+        if subdir is not None:
+            self.eval_cwd = self.worktree_path / subdir
+            logger.info("eval_cwd set to subdir: %s", self.eval_cwd)
 
         # Verify eval_cwd exists after checkout.  If it's missing the worktree
         # was created but the expected subdir is absent — surface this clearly
@@ -288,6 +312,7 @@ class HypothesisWorktree:
             raise RuntimeError(
                 f"Worktree created at {self.worktree_path} but expected "
                 f"eval_cwd {self.eval_cwd} does not exist.  "
+                f"Git root: {git_root}, subdir: {subdir}. "
                 "Check that the repo subdir is tracked on the current HEAD "
                 "and that the CodeAgent did not delete it during generation."
             )

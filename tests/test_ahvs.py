@@ -468,7 +468,7 @@ class TestHypothesisWorktree:
         not_a_repo.mkdir()
         wt_path = tmp_path / "worktrees" / "H1"
         wt = HypothesisWorktree(not_a_repo, wt_path)
-        with pytest.raises(RuntimeError, match="Failed to create worktree"):
+        with pytest.raises(RuntimeError, match="git root|git repository"):
             wt.create()
 
     def test_cleanup_without_create_is_noop(self, tmp_path: Path) -> None:
@@ -2143,3 +2143,412 @@ class TestBugE_SpliceFunctions:
         assert "return 999" in result
         assert "return 1" not in result
         assert "def standalone()" in result
+
+
+# ---------------------------------------------------------------------------
+# 13. v7 review improvements — cross-cycle memory, enriched context,
+#     JSON parsing, skill semantics, eval-mode intelligence, worktree subdir
+# ---------------------------------------------------------------------------
+
+
+class TestCrossCycleMemoryStageNameFix:
+    """P0 Fix 1: context_loader queries EvolutionStore with 'ahvs_execution'
+    (matching the stage_name used when writing lessons at Stage 7).
+    """
+
+    def test_context_loader_queries_ahvs_execution(self) -> None:
+        """load_context_bundle must query 'ahvs_execution', not 'ahvs_hypothesis_gen'."""
+        import inspect
+        from researchclaw.ahvs.context_loader import load_context_bundle
+
+        source = inspect.getsource(load_context_bundle)
+        assert '"ahvs_execution"' in source
+        assert '"ahvs_hypothesis_gen"' not in source
+
+    def test_lessons_round_trip_with_matching_stage_name(self, tmp_path: Path) -> None:
+        """Lessons written as ahvs_execution should be retrieved with 2x boost."""
+        from researchclaw.evolution import EvolutionStore, LessonEntry
+        from datetime import datetime, timezone
+
+        store = EvolutionStore(tmp_path / "evolution")
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+        # Write lessons with ahvs_execution stage_name (as executor does)
+        store.append(LessonEntry(
+            stage_name="ahvs_execution",
+            stage_num=6,
+            category="experiment",
+            severity="info",
+            description="H1 improved precision by +5%",
+            timestamp=now,
+        ))
+        store.append(LessonEntry(
+            stage_name="other_stage",
+            stage_num=1,
+            category="pipeline",
+            severity="info",
+            description="Some unrelated lesson",
+            timestamp=now,
+        ))
+
+        # Query as context_loader now does
+        results = store.query_for_stage("ahvs_execution", max_lessons=5)
+        assert len(results) >= 1
+        # The ahvs_execution lesson should be ranked first (2x boost)
+        assert results[0].stage_name == "ahvs_execution"
+        assert "H1 improved precision" in results[0].description
+
+
+class TestEnrichedOnboardingContext:
+    """P0 Fix 2: enriched baseline fields are forwarded into context_bundle."""
+
+    def test_enriched_fields_forwarded(self, tmp_path: Path) -> None:
+        """Fields like optimization_goal, constraints, etc. appear in context_bundle."""
+        from researchclaw.ahvs.context_loader import load_context_bundle
+
+        baseline = {
+            "primary_metric": "precision",
+            "precision": 0.67,
+            "recorded_at": "2026-03-24T10:00:00Z",
+            "eval_command": "echo 'precision: 0.67'",
+            "optimization_goal": "Improve elon_musk_fan precision without tanking F1",
+            "regression_floor": 0.68,
+            "constraints": ["Do not change pro_palestine cohort", "Budget: Flash Lite only"],
+            "system_levers": ["binary threshold", "cohort-specific prompt", "parsing.py"],
+            "prior_experiments": ["Tried threshold change — no effect due to eval-only bug"],
+            "notes": "elon_musk_fan has 12 FP vs 3 TP",
+        }
+        baseline_path = tmp_path / "baseline_metric.json"
+        baseline_path.write_text(json.dumps(baseline))
+
+        bundle = load_context_bundle(
+            repo_path=tmp_path,
+            question="Improve precision",
+            evolution_dir=tmp_path / "evolution",
+            baseline_path=baseline_path,
+        )
+
+        assert "enriched_context" in bundle
+        ec = bundle["enriched_context"]
+        assert ec["optimization_goal"] == baseline["optimization_goal"]
+        assert ec["regression_floor"] == baseline["regression_floor"]
+        assert ec["constraints"] == baseline["constraints"]
+        assert ec["system_levers"] == baseline["system_levers"]
+        assert ec["prior_experiments"] == baseline["prior_experiments"]
+        assert ec["notes"] == baseline["notes"]
+
+    def test_empty_enriched_fields_omitted(self, tmp_path: Path) -> None:
+        """When no enriched fields are present, enriched_context is empty dict."""
+        from researchclaw.ahvs.context_loader import load_context_bundle
+
+        baseline = {
+            "primary_metric": "f1",
+            "f1": 0.73,
+            "recorded_at": "2026-03-24T10:00:00Z",
+            "eval_command": "echo 'f1: 0.73'",
+        }
+        baseline_path = tmp_path / "baseline_metric.json"
+        baseline_path.write_text(json.dumps(baseline))
+
+        bundle = load_context_bundle(
+            repo_path=tmp_path,
+            question="test",
+            evolution_dir=tmp_path / "evolution",
+            baseline_path=baseline_path,
+        )
+
+        assert bundle["enriched_context"] == {}
+
+    def test_enriched_context_in_prompt_template(self) -> None:
+        """The hypothesis-generation prompt template includes {enriched_context}."""
+        from researchclaw.ahvs.prompts import _AHVS_STAGES
+
+        user_prompt = _AHVS_STAGES["ahvs_hypothesis_gen"]["user"]
+        assert "{enriched_context}" in user_prompt
+        assert "Operator Context" in user_prompt
+
+
+class TestJSONParsing:
+    """P1 Fix 1: structured JSON parsing with markdown fallback."""
+
+    def test_parse_hypotheses_json_array(self) -> None:
+        """JSON array of hypothesis objects should be parsed correctly."""
+        from researchclaw.ahvs.executor import _parse_hypotheses
+
+        text = json.dumps([
+            {
+                "id": "H1",
+                "type": "code_change",
+                "description": "Improve ranking algorithm",
+                "rationale": "Current ranking is naive",
+                "estimated_cost": "medium",
+                "required_tools": "pytest",
+            },
+            {
+                "id": "H2",
+                "type": "prompt_rewrite",
+                "description": "Rewrite system prompt",
+                "rationale": "Too verbose",
+                "estimated_cost": "low",
+                "required_tools": "promptfoo",
+            },
+        ])
+        result = _parse_hypotheses(text)
+        assert len(result) == 2
+        assert result[0]["id"] == "H1"
+        assert result[0]["type"] == "code_change"
+        assert result[1]["id"] == "H2"
+        assert result[1]["required_tools"] == ["promptfoo"]
+
+    def test_parse_hypotheses_fenced_json(self) -> None:
+        """JSON inside a ```json fenced block should be parsed."""
+        from researchclaw.ahvs.executor import _parse_hypotheses
+
+        text = (
+            "Here are my hypotheses:\n\n"
+            "```json\n"
+            '[{"id": "H1", "type": "code_change", "description": "fix algo"}]\n'
+            "```\n"
+        )
+        result = _parse_hypotheses(text)
+        assert len(result) == 1
+        assert result[0]["id"] == "H1"
+
+    def test_parse_hypotheses_markdown_fallback(self) -> None:
+        """Traditional markdown format still works when JSON is absent."""
+        from researchclaw.ahvs.executor import _parse_hypotheses
+
+        text = (
+            "## H1\n"
+            "**Type:** code_change\n"
+            "**Description:** Fix the ranking\n"
+            "**Rationale:** It's broken\n"
+            "**Estimated Cost:** low\n"
+            "**Required Tools:** pytest\n"
+        )
+        result = _parse_hypotheses(text)
+        assert len(result) == 1
+        assert result[0]["id"] == "H1"
+        assert result[0]["type"] == "code_change"
+        assert result[0]["required_tools"] == ["pytest"]
+
+    def test_parse_hypotheses_invalid_json_falls_through(self) -> None:
+        """Invalid JSON falls through to markdown parser."""
+        from researchclaw.ahvs.executor import _parse_hypotheses
+
+        text = (
+            '{bad json}\n'
+            "## H1\n"
+            "**Type:** prompt_rewrite\n"
+            "**Description:** Better prompt\n"
+        )
+        result = _parse_hypotheses(text)
+        assert len(result) == 1
+        assert result[0]["id"] == "H1"
+        assert result[0]["type"] == "prompt_rewrite"
+
+    def test_parse_hypotheses_json_missing_required_fields(self) -> None:
+        """JSON objects missing required fields are skipped."""
+        from researchclaw.ahvs.executor import _parse_hypotheses
+
+        text = json.dumps([
+            {"id": "H1", "type": "code_change", "description": "good one"},
+            {"id": "H2"},  # missing type and description
+            {"type": "prompt_rewrite"},  # missing id
+        ])
+        result = _parse_hypotheses(text)
+        assert len(result) == 1
+        assert result[0]["id"] == "H1"
+
+    def test_parse_hypotheses_json_required_tools_as_list(self) -> None:
+        """required_tools as a list should be kept as-is."""
+        from researchclaw.ahvs.executor import _parse_hypotheses
+
+        text = json.dumps([{
+            "id": "H1", "type": "code_change", "description": "test",
+            "required_tools": ["pytest", "docker"],
+        }])
+        result = _parse_hypotheses(text)
+        assert result[0]["required_tools"] == ["pytest", "docker"]
+
+    def test_parse_selection_json(self) -> None:
+        """Selection as JSON object should be parsed correctly."""
+        from researchclaw.ahvs.executor import _parse_selection
+
+        text = json.dumps({"selected": ["H1", "H3"], "rationale": "Best coverage"})
+        result = _parse_selection(text)
+        assert result["selected"] == ["H1", "H3"]
+        assert result["rationale"] == "Best coverage"
+
+    def test_parse_selection_markdown_fallback(self) -> None:
+        """Traditional selection format still works."""
+        from researchclaw.ahvs.executor import _parse_selection
+
+        text = "Selected: H1, H2\n**Rationale:** They look promising"
+        result = _parse_selection(text)
+        assert "H1" in result["selected"]
+        assert "H2" in result["selected"]
+
+    def test_parse_validation_plan_json(self) -> None:
+        """Validation plan as JSON array should be parsed correctly."""
+        from researchclaw.ahvs.executor import _parse_validation_plan
+
+        text = json.dumps([{
+            "id": "H1",
+            "implementation_approach": "Modify ranking function",
+            "eval_method": "custom_script",
+            "skill": "sandbox_run",
+            "success_criterion": "f1 > 0.80",
+            "expected_artifacts": "src/ranking.py",
+        }])
+        result = _parse_validation_plan(text)
+        assert len(result) == 1
+        assert result[0]["id"] == "H1"
+        assert result[0]["eval_method"] == "custom_script"
+
+    def test_parse_validation_plan_markdown_fallback(self) -> None:
+        """Traditional validation plan format still works."""
+        from researchclaw.ahvs.executor import _parse_validation_plan
+
+        text = (
+            "## H1\n"
+            "**Implementation Approach:** Rewrite the search\n"
+            "**Eval Method:** custom_script\n"
+            "**Skill:** sandbox_run\n"
+            "**Success Criterion:** f1 > 0.80\n"
+            "**Expected Artifacts:** ranking.py\n"
+        )
+        result = _parse_validation_plan(text)
+        assert len(result) == 1
+        assert result[0]["id"] == "H1"
+
+
+class TestSkillSemanticsConsistency:
+    """P1 Fix 2: skill descriptions must be consistent — advisory, not runtime-resolved."""
+
+    def test_context_block_says_advisory(self) -> None:
+        """to_context_block should describe skills as guidance, not runtime dispatch."""
+        from researchclaw.ahvs.skills import SkillLibrary, BUILTIN_SKILLS
+
+        lib = SkillLibrary()
+        block = lib.to_context_block(BUILTIN_SKILLS[:2])
+        assert "guidance" in block.lower() or "approach" in block.lower()
+        assert "resolve skill invocations" not in block.lower()
+
+    def test_module_docstring_says_advisory(self) -> None:
+        """Module docstring should say skills are informational guidance."""
+        import researchclaw.ahvs.skills as skills_mod
+
+        doc = skills_mod.__doc__ or ""
+        assert "informational guidance" in doc.lower()
+
+
+class TestEvalModeIntelligence:
+    """P2 Fix 1: warn when prompt_rewrite hypothesis + --eval-only eval command."""
+
+    def test_prompt_rewrite_with_eval_only_warns(self, capsys) -> None:
+        """Should print a warning when prompt_rewrite meets --eval-only."""
+        from researchclaw.ahvs.executor import _run_single_hypothesis
+        from researchclaw.ahvs.skills import SkillLibrary
+
+        # We can't easily run _run_single_hypothesis (requires LLM), but we
+        # can test the warning logic directly by checking the source code
+        import inspect
+        source = inspect.getsource(_run_single_hypothesis)
+        assert "_NEEDS_REINFERENCE_TYPES" in source
+        assert "prompt_rewrite" in source
+        assert "model_comparison" in source
+        assert "--eval-only" in source
+
+    def test_code_change_not_in_reinference_types(self) -> None:
+        """code_change should NOT trigger eval-mode warning."""
+        import inspect
+        from researchclaw.ahvs.executor import _run_single_hypothesis
+
+        source = inspect.getsource(_run_single_hypothesis)
+        # The set should contain prompt_rewrite and model_comparison but not code_change
+        assert '"code_change"' not in source.split("_NEEDS_REINFERENCE_TYPES")[1].split("}")[0]
+
+
+class TestWorktreeSubdirHardening:
+    """P2 Fix 2: improved diagnostics for worktree subdir handling."""
+
+    def test_non_git_repo_gives_clear_error(self, tmp_path: Path) -> None:
+        """Attempting to create worktree from non-git dir should mention git root."""
+        not_a_repo = tmp_path / "not_a_repo"
+        not_a_repo.mkdir()
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(not_a_repo, wt_path)
+
+        with pytest.raises(RuntimeError, match="git root"):
+            wt.create()
+
+    def test_subdir_not_under_git_root_gives_clear_error(self, tmp_path: Path) -> None:
+        """If repo_path is somehow not under git root, error should be clear."""
+        # This is a very edge case — just verify the code handles it
+        import inspect
+        from researchclaw.ahvs.worktree import HypothesisWorktree
+
+        source = inspect.getsource(HypothesisWorktree.create)
+        assert "not under git root" in source.lower() or "not under git root" in source
+
+    def test_subdir_worktree_eval_runs_from_correct_dir(self, tmp_path: Path) -> None:
+        """Eval command in subdir worktree runs from the correct subdirectory."""
+        git_root = tmp_path / "git_root"
+        git_root.mkdir()
+        _init_git_repo(git_root)
+        subdir = git_root / "myproject"
+        subdir.mkdir()
+        (subdir / "check.py").write_text("print('ok')\n")
+        subprocess.run(["git", "add", "."], cwd=str(git_root), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add project"],
+            cwd=str(git_root), capture_output=True, check=True,
+        )
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(git_root / "myproject", wt_path)
+        wt.create()
+
+        # Run eval that checks we're in the right directory
+        result = wt.run_eval_command("ls check.py")
+        assert result.returncode == 0
+        assert "check.py" in result.stdout
+
+        wt.cleanup()
+
+    def test_subdir_worktree_full_roundtrip(self, tmp_path: Path) -> None:
+        """Full round-trip: create subdir worktree, apply files, run eval, capture diff."""
+        git_root = tmp_path / "git_root"
+        git_root.mkdir()
+        _init_git_repo(git_root)
+        subdir = git_root / "app"
+        subdir.mkdir()
+        (subdir / "main.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "."], cwd=str(git_root), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add app"],
+            cwd=str(git_root), capture_output=True, check=True,
+        )
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(git_root / "app", wt_path)
+        wt.create()
+
+        # Apply a file change
+        wt.apply_files({"main.py": "x = 42\n"})
+
+        # Verify file landed in the right place
+        assert (wt_path / "app" / "main.py").read_text() == "x = 42\n"
+
+        # Run eval from correct dir
+        result = wt.run_eval_command("python3 -c \"exec(open('main.py').read()); print(f'x={x}')\"")
+        assert result.returncode == 0
+        assert "x=42" in result.stdout
+
+        # Capture diff
+        diff = wt.capture_diff()
+        assert "main.py" in diff
+        assert "+x = 42" in diff
+
+        wt.cleanup()
