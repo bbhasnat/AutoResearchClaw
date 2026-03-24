@@ -420,7 +420,7 @@ class CodeAgent:
                 exp_plan=exp_plan[:4000],  # Truncate to avoid token overflow
                 pkg_hint=pkg_hint,
             )
-            resp = self._chat(sp.system, sp.user, max_tokens=8192)
+            resp = self._chat(sp.system, sp.user, max_tokens=16384)
 
             # Extract code from response
             code = self._extract_single_file_code(resp.content, file_name)

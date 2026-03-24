@@ -979,11 +979,108 @@ def _run_single_hypothesis(
 
     # Build CodeAgent problem statement
     eval_command = baseline.get("eval_command", "")
+
+    # Collect repo source files for the CodeAgent prompt
+    repo_files_listing = ""
+    try:
+        src_files = sorted(
+            str(p.relative_to(config.repo_path))
+            for p in config.repo_path.rglob("*.py")
+            if ".ahvs" not in p.parts
+            and "__pycache__" not in p.parts
+            and ".git" not in p.parts
+            and "autoresearch" not in p.parts
+        )
+        if src_files:
+            repo_files_listing = (
+                "### Existing source files (modify these, do NOT create new standalone scripts):\n"
+                + "\n".join(f"- `{f}`" for f in src_files[:30])
+                + "\n\n"
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Extract public API signatures from key source files so the CodeAgent
+    # knows which functions/classes/constants MUST be preserved when rewriting
+    # a module.  Without this, the CodeAgent may drop functions that other
+    # modules import, causing ImportError at eval time.
+    api_signatures = ""
+    try:
+        import ast as _ast
+
+        api_lines: list[str] = []
+        for src_rel in src_files[:15]:
+            src_path = config.repo_path / src_rel
+            if not src_path.is_file():
+                continue
+            try:
+                tree = _ast.parse(src_path.read_text(encoding="utf-8"), filename=src_rel)
+            except SyntaxError:
+                continue
+            exports: list[str] = []
+            for node in _ast.iter_child_nodes(tree):
+                if isinstance(node, _ast.FunctionDef | _ast.AsyncFunctionDef):
+                    args = ", ".join(a.arg for a in node.args.args)
+                    exports.append(f"  def {node.name}({args})")
+                elif isinstance(node, _ast.ClassDef):
+                    exports.append(f"  class {node.name}")
+                elif isinstance(node, _ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, _ast.Name) and target.id.isupper():
+                            exports.append(f"  {target.id} = ...")
+            if exports:
+                api_lines.append(f"#### `{src_rel}`")
+                api_lines.extend(exports)
+        if api_lines:
+            api_signatures = (
+                "### Public API of existing modules (MUST preserve these names when modifying):\n"
+                "When you rewrite a file, you MUST keep all functions, classes, and\n"
+                "constants listed below. Other modules import them — removing or\n"
+                "renaming them will cause ImportError at eval time.\n\n"
+                + "\n".join(api_lines)
+                + "\n\n"
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
     repo_grounding = (
-        f"## Repo-Grounded Execution\n"
+        f"## Repo-Grounded Execution — CRITICAL INSTRUCTIONS\n"
         f"Your generated files will be applied to a git worktree of the target\n"
         f"repository. Use paths **relative to the repo root**.\n"
         f"Repository root: {config.repo_path}\n\n"
+        f"**IMPORTANT: You MUST modify EXISTING repo source files in-place.**\n"
+        f"Do NOT create standalone scripts (main.py, config.py, evaluation.py, etc.).\n"
+        f"The eval_command runs the EXISTING pipeline — only changes to existing\n"
+        f"source files will be picked up. New standalone files are NEVER executed.\n\n"
+        f"When generating files, use the EXACT relative path of the existing file\n"
+        f"you want to modify (e.g. `src/autoqa/parsing.py`, not `parsing.py` or\n"
+        f"`my_parsing_fix.py`).\n\n"
+        f"## PARTIAL OUTPUT MODE — CRITICAL\n"
+        f"Do NOT rewrite the entire file. Output ONLY the functions, methods,\n"
+        f"classes, or constants you are modifying or adding.\n"
+        f"The framework will splice your changes into the existing file at the\n"
+        f"correct locations (matched by function/class name).\n\n"
+        f"Rules for partial output:\n"
+        f"- Output ONLY the complete definition of each function/method/class you\n"
+        f"  are changing. Do NOT include unchanged functions.\n"
+        f"- If you modify a method inside a class, output the ENTIRE class\n"
+        f"  definition (with all its methods, including unchanged ones).\n"
+        f"- Include any NEW import statements your changes require at the top.\n"
+        f"  Do NOT repeat existing imports.\n"
+        f"- For new top-level constants or variables, include the assignment.\n"
+        f"- Do NOT include the rest of the file (unchanged functions, module\n"
+        f"  docstrings, etc.) — only your changes.\n\n"
+        f"Example — if you only need to change the `classify_user` function in\n"
+        f"`src/autoqa/parsing.py`:\n"
+        f"```\n"
+        f"# New imports your change needs (if any)\n"
+        f"from collections import Counter\n\n"
+        f"def classify_user(user_data, threshold=0.7):\n"
+        f"    # Your complete modified implementation\n"
+        f"    ...\n"
+        f"```\n\n"
+        f"{repo_files_listing}"
+        f"{api_signatures}"
     )
     eval_section = ""
     if eval_command:
@@ -992,7 +1089,9 @@ def _run_single_hypothesis(
             f"After your files are applied, this command will be run in the\n"
             f"worktree to measure the result:\n"
             f"```\n{eval_command}\n```\n"
-            f"Make sure your output is compatible with this command.\n\n"
+            f"**This command runs the existing pipeline.** Only modifications to\n"
+            f"existing source files (listed above) will affect the result.\n"
+            f"Standalone scripts you create will NOT be executed.\n\n"
         )
     problem = (
         f"# AHVS Hypothesis Execution\n\n"
@@ -1105,6 +1204,7 @@ def _run_single_hypothesis(
             exp_plan=problem,
             metric=metric_name,
             pkg_hint=pkg_hint,
+            max_tokens=16384,
         )
 
         # Write generated files to work_dir (with path validation)
@@ -1117,11 +1217,43 @@ def _run_single_hypothesis(
             fpath.write_text(content, encoding="utf-8")
             artifact_paths.append(str(fpath.relative_to(cycle_dir)))
 
-        # Apply generated files to worktree
-        if worktree is not None and agent_result.files:
-            worktree.apply_files(agent_result.files)
+        # Filter out syntactically invalid Python files before applying to
+        # worktree — the CodeAgent may return truncated output that passed
+        # hard_validation's max-repair limit.
+        # NOTE: In splice mode, partial output is valid Python fragments
+        # (individual functions/classes) so we still validate syntax.
+        valid_files = {}
+        for filename, content in agent_result.files.items():
+            if filename.endswith(".py"):
+                try:
+                    compile(content, filename, "exec")
+                    valid_files[filename] = content
+                except SyntaxError as syn_err:
+                    logger.warning(
+                        "%s: dropping %s from worktree apply — SyntaxError: %s "
+                        "(likely truncated LLM output, %d lines generated)",
+                        hyp_id, filename, syn_err.msg, content.count("\n") + 1,
+                    )
+            else:
+                valid_files[filename] = content
+
+        # Apply files with splice=True: partial output (only modified
+        # functions/classes) is merged into existing files via AST splicing.
+        # This avoids the truncation problem from rewriting entire large files.
+        if worktree is not None and valid_files:
+            worktree.apply_files(valid_files, splice=True)
 
         # ── Five-tier metric extraction ──────────────────────────────
+
+        # Warn if prompt_rewrite uses --eval-only (prompt changes need re-inference)
+        if hyp_type == "prompt_rewrite" and eval_command and "--eval-only" in eval_command:
+            logger.warning(
+                "%s: prompt_rewrite hypothesis using --eval-only eval_command. "
+                "Prompt changes require full re-inference to measure; "
+                "--eval-only only re-parses from cached analyst_raw. "
+                "Consider removing --eval-only for prompt_rewrite hypotheses.",
+                hyp_id,
+            )
 
         # Tier 0 (NEW): eval_command in worktree
         if (
