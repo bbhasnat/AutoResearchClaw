@@ -8,6 +8,9 @@ Covers:
   5. Checkpoint write/read/resume round-trip
   6. Stage dispatcher routing (all 8 stages have handlers)
   7. One end-to-end cycle with mocked LLM and CodeAgent
+  8. Bug A regression: apply_files writes to eval_cwd subdir, not worktree root
+  9. Bug C regression: missing eval_cwd surfaces clear error (create + run_eval_command)
+ 10. Bug E regression: splice_functions merges partial output correctly
 """
 
 from __future__ import annotations
@@ -1904,3 +1907,239 @@ class TestApplyBestFunction:
         assert updated["applied_hypothesis"] == "H1"
         assert "recorded_at" in updated
         assert "commit" in updated  # git rev-parse HEAD should succeed
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Bugs A, C, E
+# (added 2026-03-24 — previously fixed but not covered by tests)
+# ---------------------------------------------------------------------------
+
+
+class TestBugA_EvalCwdSubdirWriteBase:
+    """Bug A regression: apply_files must write relative to eval_cwd, not worktree root.
+
+    Scenario: repo_path is a subdirectory of the git root (e.g. the target repo
+    lives at /git-root/autoqa/).  The worktree is created at the git root level,
+    so files must land at {worktree}/autoqa/src/file.py — NOT {worktree}/src/file.py.
+    """
+
+    def test_eval_cwd_is_set_to_subdir_after_create(self, tmp_path: Path) -> None:
+        git_root = tmp_path / "git_root"
+        git_root.mkdir()
+        _init_git_repo(git_root)
+        subdir = git_root / "autoqa"
+        subdir.mkdir()
+        (subdir / "module.py").write_text("def foo(): pass\n")
+        subprocess.run(["git", "add", "."], cwd=str(git_root), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add subdir"],
+            cwd=str(git_root), capture_output=True, check=True,
+        )
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(git_root / "autoqa", wt_path)
+        wt.create()
+
+        assert wt.eval_cwd == wt_path / "autoqa"
+        wt.cleanup()
+
+    def test_apply_files_writes_under_eval_cwd_not_worktree_root(self, tmp_path: Path) -> None:
+        git_root = tmp_path / "git_root"
+        git_root.mkdir()
+        _init_git_repo(git_root)
+        subdir = git_root / "autoqa"
+        subdir.mkdir()
+        (subdir / "module.py").write_text("def foo(): pass\n")
+        subprocess.run(["git", "add", "."], cwd=str(git_root), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add subdir"],
+            cwd=str(git_root), capture_output=True, check=True,
+        )
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(git_root / "autoqa", wt_path)
+        wt.create()
+
+        wt.apply_files({"src/new_file.py": "x = 1\n"})
+
+        # Must land under eval_cwd (autoqa subdir), NOT at worktree root
+        assert (wt_path / "autoqa" / "src" / "new_file.py").exists()
+        assert not (wt_path / "src" / "new_file.py").exists()
+
+        wt.cleanup()
+
+
+class TestBugC_EvalCwdExistenceCheck:
+    """Bug C regression: missing eval_cwd must surface a clear error, not silent ENOENT.
+
+    Two surfaces:
+    1. create() raises RuntimeError if eval_cwd subdir is absent after checkout.
+    2. run_eval_command() returns an EvalResult with returncode=-1 and a clear
+       error message if eval_cwd has been deleted after create().
+    """
+
+    def test_create_raises_when_subdir_not_tracked(self, tmp_path: Path) -> None:
+        """eval_cwd subdir exists on disk but is NOT committed → absent in worktree."""
+        git_root = tmp_path / "git_root"
+        git_root.mkdir()
+        _init_git_repo(git_root)
+
+        # Create the subdir locally but do NOT commit it
+        untracked = git_root / "autoqa"
+        untracked.mkdir()
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(untracked, wt_path)
+
+        with pytest.raises(RuntimeError, match="eval_cwd"):
+            wt.create()
+
+    def test_run_eval_command_returns_error_when_eval_cwd_deleted(self, tmp_path: Path) -> None:
+        """After create(), if eval_cwd is removed, run_eval_command returns a clear error."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        # Simulate eval_cwd being deleted (e.g., CodeAgent wiped the subdir)
+        wt.eval_cwd = wt_path / "nonexistent_subdir"
+
+        result = wt.run_eval_command("echo hello")
+
+        assert result.returncode == -1
+        assert "eval_cwd" in result.stderr.lower() or "eval_cwd" in result.stdout.lower()
+
+        wt.cleanup()
+
+
+class TestBugE_SpliceFunctions:
+    """Bug E regression: splice_functions must correctly merge partial CodeAgent
+    output into existing files without truncation or API loss.
+    """
+
+    def test_replace_existing_function(self) -> None:
+        """Modified function replaces original; unmodified functions are preserved."""
+        from researchclaw.ahvs.worktree import splice_functions
+
+        original = textwrap.dedent("""\
+            def foo(x):
+                return x + 1
+
+            def bar(y):
+                return y * 2
+        """)
+        partial = textwrap.dedent("""\
+            def foo(x):
+                return x + 100
+        """)
+        result = splice_functions(original, partial)
+        assert "return x + 100" in result      # modified version kept
+        assert "return x + 1\n" not in result   # old version gone (exact line)
+        assert "def bar(y)" in result           # untouched function preserved
+        assert "return y * 2" in result
+
+    def test_append_new_function(self) -> None:
+        """A function not present in the original is appended."""
+        from researchclaw.ahvs.worktree import splice_functions
+
+        original = textwrap.dedent("""\
+            def foo(x):
+                return x + 1
+        """)
+        partial = textwrap.dedent("""\
+            def baz(z):
+                return z ** 2
+        """)
+        result = splice_functions(original, partial)
+        assert "def foo(x)" in result
+        assert "return x + 1" in result
+        assert "def baz(z)" in result
+        assert "return z ** 2" in result
+
+    def test_replace_and_append_combined(self) -> None:
+        """Partial output that both modifies existing and adds new definitions."""
+        from researchclaw.ahvs.worktree import splice_functions
+
+        original = textwrap.dedent("""\
+            def foo(x):
+                return x
+
+            def bar(y):
+                return y
+        """)
+        partial = textwrap.dedent("""\
+            def foo(x):
+                return x * 10
+
+            def new_helper(z):
+                return z + 99
+        """)
+        result = splice_functions(original, partial)
+        assert "return x * 10" in result     # foo modified
+        assert "def bar(y)" in result        # bar preserved
+        assert "def new_helper(z)" in result # new function added
+        assert "return z + 99" in result
+
+    def test_syntax_error_in_original_returns_partial(self) -> None:
+        """If original has a syntax error, fall back to returning partial as-is."""
+        from researchclaw.ahvs.worktree import splice_functions
+
+        original = "def foo(: bad syntax here"
+        partial = "def foo(x):\n    return x\n"
+        result = splice_functions(original, partial)
+        assert result == partial
+
+    def test_syntax_error_in_partial_returns_original(self) -> None:
+        """If partial has a syntax error, fall back to returning original unchanged."""
+        from researchclaw.ahvs.worktree import splice_functions
+
+        original = "def foo(x):\n    return x\n"
+        partial = "def foo(: bad syntax"
+        result = splice_functions(original, partial)
+        assert result == original
+
+    def test_new_import_propagated(self) -> None:
+        """New imports in partial are added to the merged result."""
+        from researchclaw.ahvs.worktree import splice_functions
+
+        original = textwrap.dedent("""\
+            import os
+
+            def foo():
+                pass
+        """)
+        partial = textwrap.dedent("""\
+            import json
+
+            def foo():
+                return json.dumps({})
+        """)
+        result = splice_functions(original, partial)
+        assert "import os" in result
+        assert "import json" in result
+        assert "return json.dumps({})" in result
+
+    def test_class_definition_replaced(self) -> None:
+        """Class definitions in partial replace matching originals."""
+        from researchclaw.ahvs.worktree import splice_functions
+
+        original = textwrap.dedent("""\
+            class MyClass:
+                def method(self):
+                    return 1
+
+            def standalone():
+                pass
+        """)
+        partial = textwrap.dedent("""\
+            class MyClass:
+                def method(self):
+                    return 999
+        """)
+        result = splice_functions(original, partial)
+        assert "return 999" in result
+        assert "return 1" not in result
+        assert "def standalone()" in result

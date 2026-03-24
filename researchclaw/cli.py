@@ -405,10 +405,23 @@ def cmd_ahvs(args: argparse.Namespace) -> int:
             )
             print(f"[AHVS] Pre-specified selection: {', '.join(sel_ids)}")
 
+    until_stage: AHVSStage | None = None
+    if getattr(args, "until_stage", None):
+        try:
+            until_stage = AHVSStage[args.until_stage.upper()]
+        except KeyError:
+            valid = [s.name for s in AHVSStage]
+            print(
+                f"Error: unknown stage '{args.until_stage}'. Valid: {', '.join(valid)}",
+                file=sys.stderr,
+            )
+            return 1
+
     results = execute_ahvs_cycle(
         config,
         auto_approve=args.auto_approve,
         from_stage=from_stage,
+        until_stage=until_stage,
     )
 
     failed = [r for r in results if r.status != StageStatus.DONE]
@@ -687,6 +700,14 @@ def main(argv: list[str] | None = None) -> int:
     _ = ahvs_p.add_argument(
         "--run-dir",
         help="Override cycle output directory (default: <repo>/.ahvs/cycles/<timestamp>)",
+    )
+    _ = ahvs_p.add_argument(
+        "--until-stage",
+        help=(
+            "Stop after this stage and exit (e.g. 'AHVS_HYPOTHESIS_GEN'). "
+            "Useful for running only hypothesis generation, then resuming with "
+            "--from-stage after GUI selection."
+        ),
     )
 
     args = parser.parse_args(argv)

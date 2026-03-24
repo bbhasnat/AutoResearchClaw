@@ -9,7 +9,7 @@ AHVS is a cyclic hypothesis-validation pipeline built on top of ARC (AutoResearc
 1. [Overview](#1-overview)
 2. [How AHVS Relates to ARC](#2-how-ahvs-relates-to-arc)
 3. [The 8-Stage Cycle](#3-the-8-stage-cycle)
-4. [Three Ways to Use AHVS](#4-three-ways-to-use-ahvs)
+4. [Four Ways to Use AHVS](#4-four-ways-to-use-ahvs)
 5. [Quick Start](#5-quick-start)
 6. [Onboarding a Target Repository](#6-onboarding-a-target-repository)
 7. [CLI Reference](#7-cli-reference)
@@ -24,6 +24,11 @@ AHVS is a cyclic hypothesis-validation pipeline built on top of ARC (AutoResearc
     - [Budget Planning for Experiments](#budget-planning-for-experiments)
     - [Execution Modes](#execution-modes)
     - [Prompt Engineering Tips](#prompt-engineering-tips)
+    - [Multi-Agent Execution](#multi-agent-execution-with-claude-code-agent-teams)
+    - [Browser-Based Hypothesis Selector](#browser-based-hypothesis-selector)
+    - [AST-Based Partial Output Merging](#ast-based-partial-output-merging-splice_functions)
+    - [Framework Bug Fixes](#framework-bug-fixes)
+    - [Test Coverage](#test-coverage)
 
 ---
 
@@ -100,6 +105,7 @@ Each hypothesis gets its own worktree under `<cycle_dir>/worktrees/<ID>/`. This 
 - **Safe concurrency:** Each hypothesis has its own copy of the repo
 - **Path containment:** All CodeAgent-generated file paths are validated by a shared `validate_safe_relpath()` utility before writing — to both `tool_runs/` and worktree directories. Absolute paths, `..` traversal, and symlink escapes are rejected. The containment check uses `Path.is_relative_to()` (not string-prefix matching) to prevent false-positive bypasses
 - **Audit trail:** A `.patch` file is saved for every hypothesis
+- **Smart merging:** When CodeAgent produces partial file output (only some functions), AST-based `splice_functions` merges changes into the existing file rather than overwriting it — preserving untouched code, replacing modified definitions, and appending new ones
 
 After all hypotheses run, AHVS identifies the best improvement and keeps its worktree. All other worktrees are cleaned up. The kept worktree path and all patch paths are recorded in `cycle_summary.json`.
 
@@ -120,25 +126,30 @@ Stage 7  AHVS_REPORT_MEMORY    LLM writes cycle report; lessons → EvolutionSto
 Stage 8  AHVS_CYCLE_VERIFY     Validate all artifacts; write cycle_summary.json
 ```
 
-The gate at Stage 4 pauses for human input. It supports three selection modes:
+The gate at Stage 4 pauses for human input. It supports four selection modes:
 
 1. **Pre-specified** — If `selection.json` already exists in the cycle directory (e.g. written by a conversational Claude Code session), the gate honours it and skips all prompts. This is how conversational mode works: Claude shows you the hypotheses, you say which to run, Claude writes `selection.json`, and the executor respects your choice.
 2. **Auto-approve** (`--auto-approve`) — Selects all hypotheses. For CI/scripted runs.
 3. **Interactive** (default for CLI) — Prompts on stdin. Enter IDs (e.g. `H1 H3`), `all`, or `none` to abort.
+4. **Browser GUI** — Run hypothesis generation first with `--until-stage AHVS_HYPOTHESIS_GEN`, then launch the browser-based selector:
+   ```bash
+   python -m researchclaw.ahvs.hypothesis_selector <cycle_dir>
+   ```
+   This opens a dark-themed web UI on localhost with checkboxes for each hypothesis. After submitting, it writes `selection.json` into the cycle directory. Resume with `--from-stage AHVS_HUMAN_SELECTION`.
 
 You can also use `--selection H1,H3` on the CLI to pre-specify which hypotheses to run without interactive prompts.
 
 If the operator aborts, the cycle can be resumed from Stage 3 to regenerate hypotheses.
 
-Every stage writes a checkpoint. A failed stage stops the cycle; later stages are not run.
+Every stage writes a checkpoint. A failed stage stops the cycle; later stages are not run. You can also stop early with `--until-stage STAGE_NAME` to run only up to a specific stage (e.g. `--until-stage AHVS_HYPOTHESIS_GEN` for generation only), then resume later with `--from-stage`.
 
 > **Clean repo required:** Stage 1 pre-flight **fails** if the target repo has uncommitted changes. This is a hard requirement because AHVS creates hypothesis worktrees from committed `HEAD` — uncommitted changes in the working tree would not be included in the experiment. Commit or stash changes before starting a cycle.
 
 ---
 
-## 4. Three Ways to Use AHVS
+## 4. Four Ways to Use AHVS
 
-AHVS supports three usage modes depending on your workflow. All three produce identical results — same 8-stage cycle, same artifacts, same cross-cycle memory.
+AHVS supports four usage modes depending on your workflow. All four produce identical results — same 8-stage cycle, same artifacts, same cross-cycle memory.
 
 ### Mode 1: Conversational in Claude Code (recommended for most users)
 
@@ -209,6 +220,26 @@ for r in results:
 
 See [Python API](#11-python-api) for resumption, callbacks, and result inspection.
 
+### Mode 4: Multi-agent with GUI selection
+
+For supervised execution with multiple Claude Code agents (executor + observer) and human hypothesis selection via browser GUI. Say this to Claude Code:
+
+```
+Run AHVS on /path/to/my-project with multi-agent supervision.
+Use 3 hypotheses. Show me the GUI for selection.
+```
+
+Claude Code (as team lead) will:
+1. Generate hypotheses (Stages 1–3)
+2. Open a browser GUI for you to select which to run
+3. Spawn an executor agent (runs hypotheses) and an observer agent (verifies results, fixes framework bugs)
+4. Run each hypothesis one at a time with verification between them
+5. Generate the final report
+
+Your only manual step is clicking checkboxes in the browser. For fully automatic execution, say "auto-approve all hypotheses" to skip the GUI entirely.
+
+See [`docs/agent_teams_guide.md`](docs/agent_teams_guide.md) for the full implementation guide, agent prompts, and failure classification rules.
+
 ### Which mode should I use?
 
 | Scenario | Recommended mode |
@@ -217,6 +248,7 @@ See [Python API](#11-python-api) for resumption, callbacks, and result inspectio
 | Exploring what to optimize | **Conversational** — describe goals in natural language |
 | Running a specific experiment | **CLI** or **Conversational** — both work equally |
 | CI/CD integration | **CLI** with `--auto-approve` |
+| Supervised execution with bug-fixing | **Multi-agent** — observer catches and fixes framework bugs |
 | Scripting multi-cycle campaigns | **CLI** (bash loop) or **Python API** |
 | Embedding in existing workflows | **Python API** |
 
@@ -444,6 +476,7 @@ researchclaw ahvs [options]
 | `--auto-approve` | off | Skip interactive gate; run all hypotheses |
 | `--selection` | none | Pre-specify hypotheses to run (e.g. `H1,H3`). For conversational/agent-driven mode. |
 | `--from-stage` | *(stage 1)* | Resume from a specific stage name |
+| `--until-stage` | *(last stage)* | Stop after this stage (e.g. `AHVS_HYPOTHESIS_GEN`). Useful for split workflows — generate hypotheses, select via GUI, then resume. |
 | `--resume` | off | Resume from last written checkpoint |
 | `--regression-guard` | none | Path to regression guard shell script |
 | `--skill-registry` | none | Path to custom skill registry YAML |
@@ -459,6 +492,27 @@ researchclaw ahvs [options]
 | `--allow-sandbox-only` | off | Allow sandbox-only fallback when worktree creation fails |
 | `--apply-best` | off | Auto-apply best improving hypothesis patch and update baseline |
 | `--run-dir` | `<repo>/.ahvs/cycles/<ts>` | Override cycle output directory |
+
+### Split workflow: generate → GUI select → execute
+
+Use `--until-stage` and `--from-stage` together for a human-in-the-loop workflow:
+
+```bash
+# Step 1: Generate hypotheses only
+researchclaw ahvs --repo . --question "..." \
+  --until-stage AHVS_HYPOTHESIS_GEN
+
+# Step 2: Open browser GUI to select hypotheses
+python -m researchclaw.ahvs.hypothesis_selector \
+  .ahvs/cycles/<timestamp>
+
+# Step 3: Resume from selection (selection.json already written by GUI)
+researchclaw ahvs --repo . --question "..." \
+  --from-stage AHVS_HUMAN_SELECTION \
+  --run-dir .ahvs/cycles/<timestamp>
+```
+
+This is particularly useful when running AHVS via multi-agent teams (see [Multi-Agent Execution](#multi-agent-execution-with-claude-code-agent-teams)).
 
 ### Resuming a failed cycle
 
@@ -594,6 +648,27 @@ for r in results:
     print(r.stage.name, r.status.value)
 ```
 
+### Stopping early with until_stage
+
+```python
+from researchclaw.ahvs import AHVSConfig, execute_ahvs_cycle
+from researchclaw.ahvs.stages import AHVSStage
+
+config = AHVSConfig(repo_path="/path/to/repo", question="...")
+
+# Generate hypotheses only — stop before human selection
+results = execute_ahvs_cycle(
+    config,
+    until_stage=AHVSStage.AHVS_HYPOTHESIS_GEN,
+)
+
+# Later: resume from human selection (after GUI or manual selection.json)
+results = execute_ahvs_cycle(
+    config,
+    from_stage=AHVSStage.AHVS_HUMAN_SELECTION,
+)
+```
+
 ### Resuming from checkpoint
 
 ```python
@@ -720,9 +795,10 @@ researchclaw/ahvs/
 ├── health.py            # Pre-flight checks (tools, baseline, guard, branch)
 ├── skills.py            # SkillLibrary + 6 built-in skills
 ├── prompts.py           # AHVSPromptManager (3 stage prompts + YAML overrides)
-├── worktree.py          # HypothesisWorktree — git worktree lifecycle per hypothesis
-├── executor.py          # 8 stage handlers + execute_ahvs_stage() dispatcher
-└── runner.py            # execute_ahvs_cycle() — outer orchestration loop
+├── worktree.py              # HypothesisWorktree — git worktree lifecycle + AST splice
+├── hypothesis_selector.py   # Browser-based GUI for human hypothesis selection
+├── executor.py              # 8 stage handlers + execute_ahvs_stage() dispatcher
+└── runner.py                # execute_ahvs_cycle() — outer orchestration loop
 
 skills/ahvs_onboarding/        # Claude Code onboarding skill
 ├── SKILL.md                   # Conversational wizard: repo → .ahvs/baseline_metric.json
@@ -730,6 +806,12 @@ skills/ahvs_onboarding/        # Claude Code onboarding skill
     ├── artifact_contract.md   # Baseline JSON schema
     ├── eval_command_policy.md  # Eval command acceptance rules
     └── git_mode_policy.md     # Git vs non-git trust model
+
+skills/ahvs_multiagent/        # Claude Code multi-agent execution skill
+├── SKILL.md                   # 5-phase flow: gen → GUI → team → loop → archive
+└── references/
+    ├── agent_prompts.md       # Executor + observer prompts with placeholders
+    └── failure_classification.md  # FRAMEWORK_BUG / HYPOTHESIS_MISS / AMBIGUOUS rules
 ```
 
 ### Per-cycle artifacts
@@ -902,3 +984,96 @@ A typical improvement campaign runs 5–10 cycles. Budget accordingly — with a
 - Use `--max-hypotheses 2` for faster cycles during exploration; increase to 5 when you want broader coverage.
 - The `--auto-approve` flag is safe for unattended runs but be sure your regression guard is set up — it prevents a bad hypothesis from being silently "improved".
 - Reference concrete code paths in your question when possible: *"The chunking in `src/pipeline/splitter.py` uses fixed 512-token windows — can we improve answer\_relevance by switching to semantic chunking?"* gives CodeAgent much better starting context.
+
+### Multi-agent execution with Claude Code Agent Teams
+
+AHVS can be orchestrated by a multi-agent team using Claude Code's Agent Teams feature. This enables a supervisory pattern where:
+
+- **Team Lead** generates hypotheses and coordinates the cycle
+- **Executor** (Sonnet) runs each hypothesis via the AHVS CLI
+- **Observer** (Opus) verifies results, classifies failures, and fixes framework bugs
+
+The detailed implementation guide — including agent prompts, failure classification rules (FRAMEWORK_BUG / HYPOTHESIS_MISS / AMBIGUOUS), pytest gates, and Context7 skill usage — is in [`docs/agent_teams_guide.md`](docs/agent_teams_guide.md).
+
+**To trigger multi-agent execution conversationally**, use the `ahvs_multiagent` skill (see [`skills/ahvs_multiagent/SKILL.md`](skills/ahvs_multiagent/SKILL.md)):
+
+```
+Run AHVS on /path/to/my-project with multi-agent supervision. 3 hypotheses.
+```
+
+The skill encodes the exact 5-phase flow so nothing is left to improvisation:
+
+1. **Hypothesis generation** — Team Lead runs `--until-stage AHVS_HYPOTHESIS_GEN`, then opens the browser GUI for human selection (or auto-approves)
+2. **Team setup** — Team Lead spawns executor (sonnet) and observer (opus) with full prompts
+3. **Per-hypothesis loop** — Executor runs one hypothesis at a time; Observer verifies and fixes any framework bugs before the next hypothesis runs
+4. **Archive** — Team Lead runs Stages 7–8, shuts down the team, and reports summary
+
+### Browser-based hypothesis selector
+
+The `hypothesis_selector.py` module provides a standalone web GUI for hypothesis selection (no pip dependencies — pure stdlib):
+
+```bash
+python -m researchclaw.ahvs.hypothesis_selector <cycle_dir> ["optional question"]
+```
+
+This:
+1. Reads `hypotheses.md` from the cycle directory
+2. Serves a dark-themed HTML page on `localhost` (auto-assigned port) with checkbox cards for each hypothesis
+3. Opens the default browser automatically
+4. Blocks until the human submits their selection
+5. Writes `selection.json` in AHVS Mode 1 format (`{"selected": [...], "approved_by": "human"}`)
+
+The selector can also be called programmatically:
+
+```python
+from pathlib import Path
+from researchclaw.ahvs.hypothesis_selector import run_selector
+
+selected_ids = run_selector(Path("path/to/cycle_dir"))
+# Returns e.g. ['H1', 'H3']
+```
+
+### AST-based partial output merging (splice_functions)
+
+When CodeAgent produces a partial file (containing only some functions from an existing file), AHVS uses AST-based merging (`splice_functions` in `worktree.py`) rather than naive overwrite. This:
+
+- **Replaces** matching function/class definitions with the new versions
+- **Appends** genuinely new definitions
+- **Preserves** existing code that wasn't in the partial output
+- **Propagates** new imports from the partial file
+
+If either the original or partial file has syntax errors, the merge falls back gracefully — returning the partial output (if the original can't be parsed) or the original (if the partial can't be parsed).
+
+### Framework bug fixes
+
+The following framework bugs have been identified and fixed across recent sessions:
+
+| Bug | Description | Fix commit |
+|-----|-------------|-----------|
+| **A** | `apply_files` wrote to worktree root instead of `eval_cwd` subdir | `495c549` |
+| **B** | `--reparse` flag needed for eval-only re-derivation of parsed fields | `5a546d8` (target repo) |
+| **C** | `create()` and `run_eval_command()` silently failed on missing `eval_cwd` | `495c549` |
+| **D** | Executor's `_extract_public_api` was not preserving function signatures | `db53793` |
+| **E** | Naive file overwrite destroyed existing code when CodeAgent returned partial output | `db53793` |
+
+All bugs have regression tests in `tests/test_ahvs.py` (147 tests total, covering Bugs A, C, and E with dedicated test classes).
+
+### Test coverage
+
+AHVS has 147 unit/integration tests in `tests/test_ahvs.py` covering:
+
+1. Stage enum ordering and contracts
+2. Config validation and edge cases
+3. Health check pass/fail scenarios
+4. Skill library matching and custom registries
+5. Hypothesis worktree creation, file application, and cleanup
+6. Eval command execution in worktrees
+7. HypothesisResult serialization round-trips
+8. Bug A regression: `eval_cwd` subdir write base
+9. Bug C regression: `eval_cwd` existence checks
+10. Bug E regression: AST-based `splice_functions`
+
+Run them with:
+```bash
+python -m pytest tests/test_ahvs.py -v
+```

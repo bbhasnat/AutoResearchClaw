@@ -67,6 +67,7 @@ def execute_ahvs_cycle(
     *,
     auto_approve: bool = False,
     from_stage: AHVSStage | None = None,
+    until_stage: AHVSStage | None = None,
     skill_library: SkillLibrary | None = None,
     on_stage_complete: Any = None,
 ) -> list[AHVSStageResult]:
@@ -77,6 +78,10 @@ def execute_ahvs_cycle(
         auto_approve: If True, skip interactive gate and select all hypotheses.
         from_stage: Resume from this stage (skip earlier stages). If None,
             start from AHVS_SETUP.
+        until_stage: Stop after this stage and return. If None, run all
+            remaining stages. Useful for running only hypothesis generation
+            (``until_stage=AHVS_HYPOTHESIS_GEN``) then resuming after GUI
+            selection with ``from_stage=AHVS_HUMAN_SELECTION``.
         skill_library: Optional pre-built SkillLibrary. If None, a default
             one is constructed (using config.skill_registry_path if set).
         on_stage_complete: Optional callback(stage_result: AHVSStageResult).
@@ -102,6 +107,14 @@ def execute_ahvs_cycle(
         stages_to_run = AHVS_STAGE_SEQUENCE[start_idx:]
     else:
         stages_to_run = AHVS_STAGE_SEQUENCE
+
+    # Trim to until_stage if specified
+    if until_stage is not None:
+        until_idx = next(
+            (i for i, s in enumerate(stages_to_run) if s == until_stage),
+            len(stages_to_run) - 1,
+        )
+        stages_to_run = stages_to_run[:until_idx + 1]
 
     print(f"\n[AHVS] Cycle: {cycle_dir.name}")
     print(f"[AHVS] Question: {config.question}")
@@ -161,7 +174,12 @@ def execute_ahvs_cycle(
     total = len(results)
     print(f"\n[AHVS] Cycle ended: {done_count}/{total} stages completed")
 
-    if done_count == len(AHVS_STAGE_SEQUENCE):
+    if until_stage is not None and done_count == total:
+        print(f"[AHVS] Stopped at {until_stage.name} as requested. "
+              f"Resume with: --from-stage {AHVS_STAGE_SEQUENCE[AHVS_STAGE_SEQUENCE.index(until_stage) + 1].name}"
+              if AHVS_STAGE_SEQUENCE.index(until_stage) + 1 < len(AHVS_STAGE_SEQUENCE)
+              else f"[AHVS] Stopped at {until_stage.name} as requested.")
+    elif done_count == len(AHVS_STAGE_SEQUENCE):
         print(f"[AHVS] Full cycle complete. See: {cycle_dir / 'cycle_summary.json'}")
 
     return results
