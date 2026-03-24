@@ -244,25 +244,65 @@ _FORBIDDEN_PREFIXES: tuple[str, ...] = ("test_", "tests_")
 _FORBIDDEN_SUFFIXES: tuple[str, ...] = ("_test.py",)
 
 
-def _is_forbidden_file(relpath: str) -> str | None:
+def _is_forbidden_file(relpath: str, *, repo_has_src: bool = False) -> str | None:
     """Return a reason string if *relpath* should be hard-blocked, else None.
 
     Files in ``_WARN_BASENAMES`` are NOT blocked — use
     ``_is_warn_file()`` to check those separately.
+
+    When *repo_has_src* is True, root-level ``.py`` files (no directory
+    component) are blocked because CodeAgent should be modifying files
+    inside the ``src/`` subtree, not creating standalone scripts at the
+    repo root.
     """
     from pathlib import PurePosixPath
 
-    basename = PurePosixPath(relpath).name
+    p = PurePosixPath(relpath)
+    basename = p.name
 
     if basename in _FORBIDDEN_BASENAMES:
         return f"forbidden eval-harness file: {basename}"
 
-    if any(basename.startswith(p) for p in _FORBIDDEN_PREFIXES):
+    if any(basename.startswith(pfx) for pfx in _FORBIDDEN_PREFIXES):
         return f"test file not allowed in worktree: {basename}"
 
     if any(basename.endswith(s) for s in _FORBIDDEN_SUFFIXES):
         return f"test file not allowed in worktree: {basename}"
 
+    # Block root-level .py files when the repo has a src/ directory.
+    # CodeAgent frequently writes to e.g. "parsing.py" at the repo root
+    # instead of "src/autoqa/parsing.py".  These root-level files are
+    # never executed by the eval pipeline and waste the hypothesis.
+    if repo_has_src and basename.endswith(".py") and p.parent == PurePosixPath("."):
+        return (
+            f"root-level .py file rejected — repo has src/ directory, "
+            f"write to the correct path (e.g. src/.../{basename})"
+        )
+
+    return None
+
+
+def _remap_root_file(basename: str, repo_path: "Path") -> str | None:
+    """Try to find a unique ``src/`` file matching *basename*.
+
+    When CodeAgent writes ``parsing.py`` at the repo root but
+    ``src/autoqa/parsing.py`` exists, return the correct relative path
+    so the framework can auto-remap instead of blocking.
+
+    Returns the remapped relative path (e.g. ``src/autoqa/parsing.py``)
+    if exactly one match is found under ``src/``, else ``None``.
+    """
+    src_dir = repo_path / "src"
+    if not src_dir.is_dir():
+        return None
+    matches = [
+        p for p in src_dir.rglob(basename)
+        if p.is_file()
+        and "__pycache__" not in p.parts
+        and ".git" not in p.parts
+    ]
+    if len(matches) == 1:
+        return str(matches[0].relative_to(repo_path))
     return None
 
 
@@ -909,6 +949,51 @@ def _execute_hypothesis_gen(
             artifacts=(),
             error="LLM did not produce any parseable hypotheses",
         )
+
+    # ── Post-filter: remove unmeasurable types under --eval-only ───
+    # prompt_rewrite and model_comparison change LLM behaviour, but
+    # --eval-only reads frozen checkpoint data so these changes are
+    # structurally invisible.  Filter them at generation time instead
+    # of wasting a cycle slot.
+    _eval_cmd = baseline.get("eval_command", "")
+    _UNMEASURABLE_EVAL_ONLY_TYPES = {"prompt_rewrite", "model_comparison"}
+    if "--eval-only" in _eval_cmd:
+        before_count = len(hypotheses)
+        hypotheses = [
+            h for h in hypotheses
+            if h.get("type", "code_change") not in _UNMEASURABLE_EVAL_ONLY_TYPES
+        ]
+        dropped = before_count - len(hypotheses)
+        if dropped:
+            logger.info(
+                "Filtered %d unmeasurable hypothesis(es) (type in %s "
+                "incompatible with --eval-only eval_command)",
+                dropped, _UNMEASURABLE_EVAL_ONLY_TYPES,
+            )
+            # Rebuild raw_text to exclude filtered hypotheses
+            kept_ids = {h["id"] for h in hypotheses}
+            raw_text_lines = raw_text.splitlines()
+            keep = True
+            out_lines_filtered: list[str] = []
+            for line in raw_text_lines:
+                m = re.match(r"^##\s+(H\d+)\s*$", line)
+                if m:
+                    keep = m.group(1) in kept_ids
+                if keep:
+                    out_lines_filtered.append(line)
+            raw_text = "\n".join(out_lines_filtered)
+        if not hypotheses:
+            return AHVSStageResult(
+                stage=AHVSStage.AHVS_HYPOTHESIS_GEN,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=(
+                    "All generated hypotheses were unmeasurable under "
+                    "--eval-only mode. Re-run without --eval-only or "
+                    "request code_change type hypotheses."
+                ),
+            )
+
     if len(hypotheses) > 5:
         logger.warning(
             "LLM generated %d hypotheses — truncating to 5 (hard cap)",
@@ -1630,18 +1715,42 @@ def _run_single_hypothesis(
             fpath.write_text(content, encoding="utf-8")
             artifact_paths.append(str(fpath.relative_to(cycle_dir)))
 
-        # ── Filter forbidden files ─────────────────────────────────
-        # Reject eval-harness files and standalone scripts BEFORE
-        # syntax checking or worktree application.  This is enforced at
-        # the framework level because CodeAgent consistently ignores
-        # prompt instructions not to touch these files.
-        #
-        # Hard-blocked files are dropped.  Warn-only files (e.g. __init__.py)
-        # are kept but logged so operators can diagnose eval failures.
+        # ── Auto-remap root-level files, then filter forbidden ─────
+        # CodeAgent consistently writes files to the repo root (e.g.
+        # "parsing.py") instead of the correct src/ path (e.g.
+        # "src/autoqa/parsing.py") despite explicit prompt context.
+        # Before blocking, attempt to remap root-level .py files to
+        # their unique src/ counterpart.  Only remap when exactly one
+        # match exists under src/ to avoid ambiguity.
+        _repo_has_src = (config.repo_path / "src").is_dir()
+        remapped_files: dict[str, str] = {}
+        for filename, content in agent_result.files.items():
+            from pathlib import PurePosixPath as _PP
+            _p = _PP(filename)
+            if (
+                _repo_has_src
+                and _p.parent == _PP(".")
+                and filename.endswith(".py")
+            ):
+                remapped = _remap_root_file(_p.name, config.repo_path)
+                if remapped is not None:
+                    logger.info(
+                        "%s: auto-remapped %s → %s (root-level file "
+                        "matched unique src/ target)",
+                        hyp_id, filename, remapped,
+                    )
+                    print(
+                        f"[AHVS] {hyp_id}: auto-remapped {filename} → "
+                        f"{remapped}"
+                    )
+                    remapped_files[remapped] = content
+                    continue
+            remapped_files[filename] = content
+
         filtered_files: dict[str, str] = {}
         blocked_count = 0
-        for filename, content in agent_result.files.items():
-            reason = _is_forbidden_file(filename)
+        for filename, content in remapped_files.items():
+            reason = _is_forbidden_file(filename, repo_has_src=_repo_has_src)
             if reason is not None:
                 logger.warning(
                     "%s: BLOCKED %s from worktree apply — %s",
