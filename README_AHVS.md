@@ -117,7 +117,7 @@ If the target path is not a git repository, worktree creation fails and the hypo
 
 ```
 Stage 1  AHVS_SETUP            Pre-flight checks (baseline, clean repo, LLM connectivity — always runs), cycle dir init
-Stage 2  AHVS_CONTEXT_LOAD     Load baseline + EvolutionStore → context_bundle.json
+Stage 2  AHVS_CONTEXT_LOAD     Load baseline + enriched context + EvolutionStore → context_bundle.json
 Stage 3  AHVS_HYPOTHESIS_GEN   LLM generates 1–5 typed hypotheses
 Stage 4  AHVS_HUMAN_SELECTION  ── GATE ── operator selects which to run
 Stage 5  AHVS_VALIDATION_PLAN  LLM writes per-hypothesis implementation plan
@@ -576,7 +576,7 @@ AHVS runs a secondary pre-flight check *after* hypothesis selection (Stage 4) to
 
 ## 9. Skill Library
 
-Skills are pre-built guidance templates injected into CodeAgent's prompt context. CodeAgent reads them, picks the right one, and references it in its implementation plan. Skills are **informational** — they tell CodeAgent what tools are available and how to use them, but AHVS does not enforce or dispatch skill invocations at runtime. The `skill_planned` field in `HypothesisResult` reflects the plan's declared skill, not a runtime observation.
+Skills are pre-built guidance templates injected into CodeAgent's prompt context. CodeAgent reads them, picks the right approach for the hypothesis type, and invokes the underlying tools directly in its generated code. Skills are **purely advisory** — they describe what tools are available and how to use them, but AHVS does not enforce, dispatch, or resolve skill invocations at runtime. The `skill_planned` field in `HypothesisResult` reflects the plan's declared skill, not a runtime observation.
 
 ### Built-in skills
 
@@ -625,7 +625,19 @@ AHVS uses ARC's `EvolutionStore` to persist lessons across cycles. This means:
 
 The EvolutionStore lives at `<repo>/.ahvs/evolution/`. It is cumulative — never cleared between cycles.
 
-At Stage 2 (`AHVS_CONTEXT_LOAD`), AHVS queries the last 12 lessons from the store using structured `LessonEntry` fields (category, severity) — not keyword matching on prose. Lessons with severity `"info"` are treated as positive outcomes; those with `"warning"` or `"error"` are surfaced as rejected approaches. The LLM sees both what has worked and what has been ruled out, producing increasingly targeted hypotheses over time.
+At Stage 2 (`AHVS_CONTEXT_LOAD`), AHVS queries the last 12 lessons from the store using the stage name `"ahvs_execution"` — the same name used when writing lessons at Stage 7. This ensures the EvolutionStore's 2x relevance boost applies correctly to AHVS-specific lessons. Lessons with severity `"info"` are treated as positive outcomes; those with `"warning"` or `"error"` are surfaced as rejected approaches. The LLM sees both what has worked and what has been ruled out, producing increasingly targeted hypotheses over time.
+
+### Enriched onboarding context
+
+Stage 2 also forwards enriched fields from `baseline_metric.json` into the hypothesis-generation prompt. These fields — `optimization_goal`, `regression_floor`, `constraints`, `system_levers`, `prior_experiments`, `notes` — are written during onboarding (see [Section 6.1](#61-baseline-metric-file)) and appear in the prompt under "Operator Context". This gives the LLM richer intent signals without additional inference calls.
+
+### Hypothesis output format
+
+Stage 3 accepts hypotheses in **either** structured JSON or markdown format. When the LLM returns a JSON array of hypothesis objects (with `id`, `type`, `description` fields), AHVS parses it directly with schema validation. When the LLM returns markdown (the `## H1` / `**Type:**` format), AHVS falls back to regex parsing. The same dual-format support applies to selection and validation plan outputs. This improves reliability while maintaining full backward compatibility.
+
+### Eval-mode warnings
+
+Stage 6 detects incompatible hypothesis-type/eval-command combinations. If a `prompt_rewrite` or `model_comparison` hypothesis is paired with an eval command containing `--eval-only`, AHVS prints a visible warning explaining that changes to prompts/models have no measurable effect when the eval pipeline reads frozen checkpoint data. This prevents the "all hypotheses at baseline" failure mode discovered during initial production cycles.
 
 ---
 
@@ -824,7 +836,7 @@ skills/ahvs_multiagent/        # Claude Code multi-agent execution skill
     └── 20260318_120000/         # One directory per cycle run
         ├── ahvs_checkpoint.json      # Stage resumption checkpoint
         ├── cycle_manifest.json       # Cycle metadata + preflight results
-        ├── context_bundle.json       # Stage 2 output: baseline + lessons
+        ├── context_bundle.json       # Stage 2 output: baseline + enriched context + lessons
         ├── hypotheses.md             # Stage 3 output: generated hypotheses
         ├── selection.md              # Stage 4 output: operator selection
         ├── selection.json            # Machine-readable selection
@@ -1055,12 +1067,18 @@ The following framework bugs have been identified and fixed across recent sessio
 | **C** | `create()` and `run_eval_command()` silently failed on missing `eval_cwd` | `495c549` |
 | **D** | Executor's `_extract_public_api` was not preserving function signatures | `db53793` |
 | **E** | Naive file overwrite destroyed existing code when CodeAgent returned partial output | `db53793` |
+| **F** | Cross-cycle memory stage-name mismatch: wrote `ahvs_execution`, queried `ahvs_hypothesis_gen` | `d362902` |
+| **G** | Enriched onboarding fields (`optimization_goal`, etc.) not forwarded to hypothesis prompt | `d362902` |
+| **H** | Hypothesis parsing relied solely on markdown/regex — fragile with LLM output variation | `d362902` |
+| **I** | Skill context block claimed runtime dispatch; module docstring said advisory-only | `d362902` |
+| **J** | `prompt_rewrite` hypotheses silently unmeasurable when eval uses `--eval-only` | `d362902` |
+| **K** | Worktree `create()` gave unclear error when `--repo` was not inside a git repository | `d362902` |
 
-All bugs have regression tests in `tests/test_ahvs.py` (147 tests total, covering Bugs A, C, and E with dedicated test classes).
+All bugs have regression tests in `tests/test_ahvs.py` (169 tests total).
 
 ### Test coverage
 
-AHVS has 147 unit/integration tests in `tests/test_ahvs.py` covering:
+AHVS has 169 unit/integration tests in `tests/test_ahvs.py` covering:
 
 1. Stage enum ordering and contracts
 2. Config validation and edge cases
@@ -1072,6 +1090,12 @@ AHVS has 147 unit/integration tests in `tests/test_ahvs.py` covering:
 8. Bug A regression: `eval_cwd` subdir write base
 9. Bug C regression: `eval_cwd` existence checks
 10. Bug E regression: AST-based `splice_functions`
+11. Bug F regression: cross-cycle memory stage-name match
+12. Bug G: enriched onboarding context forwarding
+13. Bug H: structured JSON parsing with markdown fallback
+14. Bug I: skill semantics consistency
+15. Bug J: eval-mode intelligence warnings
+16. Bug K: worktree subdir hardening and full round-trip
 
 Run them with:
 ```bash

@@ -22,12 +22,20 @@ This repo is built on the principle that **lessons survive sessions**. The entir
 - Do NOT rely on conversation output as memory — it disappears
 - Do NOT mark a task complete without writing its lessons to memory first
 
-### AHVS bugs status (as of 2026-03-23):
-- **Bug A** ✅ FIXED (AutoResearchClaw commit 495c549): `apply_files` now writes to `eval_cwd` base, not worktree root
-- **Bug B** ✅ FIXED (rnd_user_cohort commit 5a546d8): `--reparse` flag re-derives `analyst_yes_no` from `analyst_raw` using current `parsing.py`; `baseline_metric.json` eval_command updated to include it. NOTE: prompt-rewrite hypotheses still need full re-inference (not eval-only).
-- **Bug C** ✅ FIXED (AutoResearchClaw commit 495c549): `create()` and `run_eval_command()` now check `eval_cwd` existence with clear error messages instead of silent ENOENT
+### AHVS bugs status (as of 2026-03-24):
+- **Bug A** ✅ FIXED (`495c549`): `apply_files` now writes to `eval_cwd` base, not worktree root
+- **Bug B** ✅ FIXED (`5a546d8` target repo): `--reparse` flag re-derives `analyst_yes_no` from `analyst_raw`. NOTE: prompt-rewrite hypotheses still need full re-inference (not eval-only).
+- **Bug C** ✅ FIXED (`495c549`): `create()` and `run_eval_command()` check `eval_cwd` existence with clear errors
+- **Bug D** ✅ FIXED (`db53793`): `_extract_public_api` preserves function signatures
+- **Bug E** ✅ FIXED (`db53793`): AST-based `splice_functions` for partial output merging
+- **Bug F** ✅ FIXED (`d362902`): Cross-cycle memory stage-name mismatch (was querying `ahvs_hypothesis_gen`, now `ahvs_execution`)
+- **Bug G** ✅ FIXED (`d362902`): Enriched onboarding fields now forwarded into hypothesis-generation prompt
+- **Bug H** ✅ FIXED (`d362902`): Structured JSON parsing with markdown/regex fallback
+- **Bug I** ✅ FIXED (`d362902`): Skill semantics made consistently advisory (code + docs)
+- **Bug J** ✅ FIXED (`d362902`): Eval-mode intelligence warns when prompt_rewrite meets --eval-only
+- **Bug K** ✅ FIXED (`d362902`): Worktree subdir handling hardened with clear diagnostics
 
-### Ready to run next AHVS cycle (all 3 blockers resolved)
+### Ready to run next AHVS cycle (all blockers resolved, 169 tests passing)
 
 ## AHVS Launch Command
 ```bash
