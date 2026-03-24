@@ -221,18 +221,21 @@ _TYPE_EXECUTION_STRATEGIES: dict[str, dict[str, str]] = {
 # points).  The prompt tells CodeAgent not to touch them; this filter
 # enforces it at the framework level.
 #
-# Hard-blocked: always rejected.
+# Hard-blocked: always rejected.  Only files that are definitively
+# eval-harness entry points — modifying these has caused eval pipeline
+# crashes in every observed case.
 _FORBIDDEN_BASENAMES: frozenset[str] = frozenset({
     "run_eval.py",
     "evaluation.py",
-    "main.py",
 })
 
-# Warn-only: logged as a warning but still applied.  __init__.py is
-# needed for legitimate package-wiring changes, so we warn rather than
-# block to avoid false negatives on valid hypotheses.
+# Warn-only: logged as a warning but still applied.  These files CAN
+# be legitimately modified by some hypotheses, but have historically
+# been a source of eval-harness corruption.  The warning helps operators
+# diagnose failures without blocking valid changes.
 _WARN_BASENAMES: frozenset[str] = frozenset({
     "__init__.py",
+    "main.py",
 })
 
 # Patterns for files that are always standalone scripts / test files
@@ -282,8 +285,26 @@ def _is_warn_file(relpath: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _find_python_and_module(eval_command: str) -> tuple[str, str] | None:
-    """Extract the Python executable and module name from *eval_command*.
+class _ParsedEvalCommand:
+    """Result of parsing an eval_command into its components."""
+
+    __slots__ = ("python_exe", "module_name", "cd_dir", "env_vars")
+
+    def __init__(
+        self,
+        python_exe: str,
+        module_name: str,
+        cd_dir: str | None = None,
+        env_vars: list[str] | None = None,
+    ) -> None:
+        self.python_exe = python_exe
+        self.module_name = module_name
+        self.cd_dir = cd_dir
+        self.env_vars = env_vars or []
+
+
+def _find_python_and_module(eval_command: str) -> _ParsedEvalCommand | None:
+    """Extract the Python executable, module name, and wrapper context.
 
     Supports common eval_command shapes:
       - ``python -m pkg.mod ...``
@@ -292,31 +313,45 @@ def _find_python_and_module(eval_command: str) -> tuple[str, str] | None:
       - ``cd /path && python -m pkg.mod ...``
       - ``VAR=val VAR2=val2 python -m pkg.mod ...``
 
-    Returns ``(python_executable, module_name)`` or None if the pattern
-    is not recognizable.
+    Returns a ``_ParsedEvalCommand`` with the python executable, module
+    name, optional ``cd`` target directory, and any env var assignments.
+    Returns None if the pattern is not recognizable.
     """
-    # Split on && or ; to handle chained commands — take the last segment
-    # that contains "-m" (the actual Python invocation).
+    # Extract cd target from chained commands before splitting
+    cd_dir: str | None = None
+    python_segment = eval_command
+
     for sep in ("&&", ";"):
         if sep in eval_command:
             segments = eval_command.split(sep)
+            # Look for cd in earlier segments
+            for segment in segments:
+                stripped = segment.strip()
+                if stripped.startswith("cd "):
+                    cd_parts = stripped.split(None, 1)
+                    if len(cd_parts) == 2:
+                        cd_dir = cd_parts[1].strip()
+            # Take the segment with -m as the python invocation
             for segment in reversed(segments):
                 if "-m" in segment:
-                    eval_command = segment.strip()
+                    python_segment = segment.strip()
                     break
             break
 
-    # Tokenize
+    # Tokenize the python segment
     import shlex
     try:
-        parts = shlex.split(eval_command)
+        parts = shlex.split(python_segment)
     except ValueError:
-        parts = eval_command.split()
+        parts = python_segment.split()
 
-    # Find -m and the module name
+    # Collect env var assignments and find -m
+    env_vars: list[str] = []
     module_name = None
     m_index = None
     for i, part in enumerate(parts):
+        if "=" in part and m_index is None:
+            env_vars.append(part)
         if part == "-m" and i + 1 < len(parts):
             module_name = parts[i + 1]
             m_index = i
@@ -330,17 +365,14 @@ def _find_python_and_module(eval_command: str) -> tuple[str, str] | None:
     python_exe = None
     if m_index > 0:
         candidate = parts[m_index - 1]
-        # Env var assignments contain "=" — skip them
         if "=" not in candidate:
             python_exe = candidate
 
     if python_exe is None:
-        # Fallback: scan backwards from -m for a token that looks like a path
-        # or "python"
         for j in range(m_index - 1, -1, -1):
             tok = parts[j]
             if "=" in tok:
-                continue  # skip env vars
+                continue
             if "python" in tok or "/" in tok:
                 python_exe = tok
                 break
@@ -348,7 +380,12 @@ def _find_python_and_module(eval_command: str) -> tuple[str, str] | None:
     if python_exe is None:
         return None
 
-    return (python_exe, module_name)
+    return _ParsedEvalCommand(
+        python_exe=python_exe,
+        module_name=module_name,
+        cd_dir=cd_dir,
+        env_vars=env_vars,
+    )
 
 
 def _run_import_sanity_check(
@@ -361,8 +398,10 @@ def _run_import_sanity_check(
     (e.g. ``python -m autoqa.run_eval`` → ``autoqa.run_eval``) and
     attempts to import it in the worktree.
 
-    Supports wrapped commands (``cd ... && ...``, ``PYTHONPATH=... python ...``).
-    If the command shape is not recognizable, the check is skipped gracefully.
+    Preserves wrapper semantics:
+    - ``cd subdir && python -m ...`` → import check runs from ``subdir``
+    - ``PYTHONPATH=src:$PYTHONPATH ...`` → env vars are preserved
+    - Non-Python commands (bash scripts) → check is skipped gracefully
 
     Returns None if the check passes or is skipped, or an error string if
     it fails.
@@ -373,19 +412,29 @@ def _run_import_sanity_check(
             "Pre-eval import check: could not parse eval_command — skipping. "
             "cmd=%s", eval_command,
         )
-        return None  # Can't determine module — skip check gracefully
+        return None
 
-    python_exe, module_name = parsed
+    # Reconstruct a faithful import check that preserves the original
+    # command's cwd and environment semantics.
+    env_prefix = " ".join(parsed.env_vars) + " " if parsed.env_vars else ""
+    # Always include PYTHONPATH=src if not already in env_vars
+    if not any(v.startswith("PYTHONPATH=") for v in parsed.env_vars):
+        env_prefix = f"PYTHONPATH=src:$PYTHONPATH {env_prefix}"
 
-    # Try importing the module in the worktree
-    check_cmd = (
-        f"PYTHONPATH=src:$PYTHONPATH {python_exe} -c "
-        f"'import {module_name}; print(\"import OK\")'"
-    )
+    import_stmt = f"import {parsed.module_name}"
+    python_part = f'{env_prefix}{parsed.python_exe} -c "{import_stmt}"'
+
+    # Preserve cd semantics: if the original command had `cd subdir && ...`,
+    # prepend it so the import check runs from the same working directory.
+    if parsed.cd_dir:
+        check_cmd = f"cd {parsed.cd_dir} && {python_part}"
+    else:
+        check_cmd = python_part
+
     result = worktree.run_eval_command(check_cmd, timeout=30)
     if result.returncode != 0:
         return (
-            f"import {module_name} failed in worktree after applying "
+            f"import {parsed.module_name} failed in worktree after applying "
             f"CodeAgent changes. stderr: {result.stderr[:300]}"
         )
     return None
@@ -1375,18 +1424,18 @@ def _run_single_hypothesis(
         f"Do NOT create standalone scripts (main.py, config.py, evaluation.py, etc.).\n"
         f"The eval_command runs the EXISTING pipeline — only changes to existing\n"
         f"source files will be picked up. New standalone files are NEVER executed.\n\n"
-        f"## FORBIDDEN FILES — DO NOT TOUCH\n"
+        f"## PROTECTED FILES — READ CAREFULLY\n"
         f"The following files are part of the eval harness infrastructure.\n"
-        f"**You MUST NOT modify, rewrite, or recreate any of these files.**\n"
-        f"Modifying them will break the eval pipeline and your hypothesis will\n"
-        f"score zero. The framework will automatically reject any changes to these:\n"
+        f"The framework enforces protection rules on these files:\n\n"
+        f"**BLOCKED (changes will be rejected by the framework):**\n"
         f"- `run_eval.py` or any file matching `**/run_eval.py` (eval entry point)\n"
-        f"- `__init__.py` (package structure)\n"
         f"- `evaluation.py` or any file matching `**/evaluation.py`\n"
-        f"- `main.py` (standalone script — never executed by eval)\n"
         f"- Any file matching `test_*.py` or `*_test.py` (test files)\n\n"
+        f"**SENSITIVE (changes are applied but flagged for review):**\n"
+        f"- `__init__.py` — modify only if your hypothesis requires package structure changes\n"
+        f"- `main.py` — modify only if it is part of the actual eval pipeline\n\n"
         f"If you need to change how evaluation works, modify the **processing logic**\n"
-        f"(parsing, prompts, config) — NOT the eval harness itself.\n\n"
+        f"(parsing, prompts, config) — NOT the eval entry points.\n\n"
         f"When generating files, use the EXACT relative path of the existing file\n"
         f"you want to modify (e.g. `src/autoqa/parsing.py`, not `parsing.py` or\n"
         f"`my_parsing_fix.py`).\n\n"

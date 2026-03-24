@@ -2583,9 +2583,11 @@ class TestForbiddenFiles:
         from researchclaw.ahvs.executor import _is_forbidden_file
         assert _is_forbidden_file("evaluation.py") is not None
 
-    def test_main_py_blocked(self) -> None:
-        from researchclaw.ahvs.executor import _is_forbidden_file
-        assert _is_forbidden_file("main.py") is not None
+    def test_main_py_is_warn_not_block(self) -> None:
+        """main.py is warn-only, not hard-blocked (v10 fix)."""
+        from researchclaw.ahvs.executor import _is_forbidden_file, _is_warn_file
+        assert _is_forbidden_file("main.py") is None
+        assert _is_warn_file("main.py") is not None
 
     def test_test_files_blocked(self) -> None:
         from researchclaw.ahvs.executor import _is_forbidden_file
@@ -2603,9 +2605,10 @@ class TestForbiddenFiles:
     def test_forbidden_basenames_constant_complete(self) -> None:
         """All known problematic files from production runs are blocked or warned."""
         from researchclaw.ahvs.executor import _FORBIDDEN_BASENAMES, _WARN_BASENAMES
-        for f in ("run_eval.py", "evaluation.py", "main.py"):
+        for f in ("run_eval.py", "evaluation.py"):
             assert f in _FORBIDDEN_BASENAMES
-        assert "__init__.py" in _WARN_BASENAMES
+        for f in ("__init__.py", "main.py"):
+            assert f in _WARN_BASENAMES
 
 
 class TestPreEvalImportSanityCheck:
@@ -2690,13 +2693,14 @@ class TestHardenedMetricExtraction:
         # Tiers 1-3 should only run when NOT authoritative
         assert "not eval_command_is_authoritative" in source
 
-    def test_forbidden_prompt_mentions_forbidden_files(self) -> None:
-        """The CodeAgent prompt should mention forbidden files."""
+    def test_prompt_mentions_protected_files(self) -> None:
+        """The CodeAgent prompt should mention protected/forbidden files."""
         import inspect
         from researchclaw.ahvs.executor import _run_single_hypothesis
 
         source = inspect.getsource(_run_single_hypothesis)
-        assert "FORBIDDEN FILES" in source
+        assert "PROTECTED FILES" in source
+        assert "run_eval.py" in source
 
 
 class TestPlanRequiredFieldsTightened:
@@ -2903,12 +2907,15 @@ class TestBehavioralEvalModeIntelligence:
 
 
 class TestFindPythonAndModule:
-    """v9 Fix 1: _find_python_and_module handles all documented eval_command shapes."""
+    """v9/v10 Fix: _find_python_and_module handles all documented eval_command shapes."""
 
     def test_simple_python_m(self) -> None:
         from researchclaw.ahvs.executor import _find_python_and_module
         result = _find_python_and_module("python3 -m autoqa.run_eval --eval-only")
-        assert result == ("python3", "autoqa.run_eval")
+        assert result is not None
+        assert result.python_exe == "python3"
+        assert result.module_name == "autoqa.run_eval"
+        assert result.cd_dir is None
 
     def test_absolute_python_path(self) -> None:
         from researchclaw.ahvs.executor import _find_python_and_module
@@ -2916,8 +2923,8 @@ class TestFindPythonAndModule:
             "/home/ubuntu/miniconda3/envs/cohort_work/bin/python -m autoqa.run_eval"
         )
         assert result is not None
-        assert result[0] == "/home/ubuntu/miniconda3/envs/cohort_work/bin/python"
-        assert result[1] == "autoqa.run_eval"
+        assert result.python_exe == "/home/ubuntu/miniconda3/envs/cohort_work/bin/python"
+        assert result.module_name == "autoqa.run_eval"
 
     def test_pythonpath_prefix(self) -> None:
         from researchclaw.ahvs.executor import _find_python_and_module
@@ -2925,8 +2932,9 @@ class TestFindPythonAndModule:
             "PYTHONPATH=src:$PYTHONPATH /usr/bin/python3 -m autoqa.run_eval --eval-only"
         )
         assert result is not None
-        assert result[0] == "/usr/bin/python3"
-        assert result[1] == "autoqa.run_eval"
+        assert result.python_exe == "/usr/bin/python3"
+        assert result.module_name == "autoqa.run_eval"
+        assert "PYTHONPATH=src:$PYTHONPATH" in result.env_vars
 
     def test_cd_and_python(self) -> None:
         from researchclaw.ahvs.executor import _find_python_and_module
@@ -2934,8 +2942,9 @@ class TestFindPythonAndModule:
             "cd /path/to/project && python -m package.run_eval --eval-only"
         )
         assert result is not None
-        assert result[0] == "python"
-        assert result[1] == "package.run_eval"
+        assert result.python_exe == "python"
+        assert result.module_name == "package.run_eval"
+        assert result.cd_dir == "/path/to/project"
 
     def test_multiple_env_vars(self) -> None:
         from researchclaw.ahvs.executor import _find_python_and_module
@@ -2943,8 +2952,9 @@ class TestFindPythonAndModule:
             "PYTHONPATH=src:$PYTHONPATH CUDA_VISIBLE_DEVICES=0 python3 -m my_pkg.eval"
         )
         assert result is not None
-        assert result[0] == "python3"
-        assert result[1] == "my_pkg.eval"
+        assert result.python_exe == "python3"
+        assert result.module_name == "my_pkg.eval"
+        assert len(result.env_vars) == 2
 
     def test_no_m_flag_returns_none(self) -> None:
         from researchclaw.ahvs.executor import _find_python_and_module
@@ -2957,7 +2967,8 @@ class TestFindPythonAndModule:
             "cd /tmp; python3 -m mymod.entry"
         )
         assert result is not None
-        assert result[1] == "mymod.entry"
+        assert result.module_name == "mymod.entry"
+        assert result.cd_dir == "/tmp"
 
     def test_real_eval_command_from_baseline(self) -> None:
         """The actual eval_command from our production baseline_metric.json."""
@@ -2971,8 +2982,8 @@ class TestFindPythonAndModule:
         )
         result = _find_python_and_module(cmd)
         assert result is not None
-        assert "python" in result[0]
-        assert result[1] == "autoqa.run_eval"
+        assert "python" in result.python_exe
+        assert result.module_name == "autoqa.run_eval"
 
 
 class TestImportCheckWrappedCommands:
@@ -3025,8 +3036,8 @@ class TestImportCheckWrappedCommands:
         wt.cleanup()
 
 
-class TestInitPyWarnOnly:
-    """v9 Fix 2: __init__.py is warn-only, not hard-blocked."""
+class TestWarnOnlyFiles:
+    """v9/v10 Fix: __init__.py and main.py are warn-only, not hard-blocked."""
 
     def test_init_py_not_in_forbidden(self) -> None:
         from researchclaw.ahvs.executor import _FORBIDDEN_BASENAMES
@@ -3036,12 +3047,100 @@ class TestInitPyWarnOnly:
         from researchclaw.ahvs.executor import _WARN_BASENAMES
         assert "__init__.py" in _WARN_BASENAMES
 
+    def test_main_py_not_in_forbidden(self) -> None:
+        from researchclaw.ahvs.executor import _FORBIDDEN_BASENAMES
+        assert "main.py" not in _FORBIDDEN_BASENAMES
+
+    def test_main_py_in_warn(self) -> None:
+        from researchclaw.ahvs.executor import _WARN_BASENAMES
+        assert "main.py" in _WARN_BASENAMES
+
     def test_is_warn_file_returns_reason(self) -> None:
         from researchclaw.ahvs.executor import _is_warn_file
         assert _is_warn_file("__init__.py") is not None
         assert _is_warn_file("src/pkg/__init__.py") is not None
+        assert _is_warn_file("main.py") is not None
 
     def test_is_warn_file_returns_none_for_normal(self) -> None:
         from researchclaw.ahvs.executor import _is_warn_file
         assert _is_warn_file("parsing.py") is None
-        assert _is_warn_file("main.py") is None  # main.py is forbidden, not warned
+        assert _is_warn_file("config.yaml") is None
+
+
+class TestImportCheckCdSemantics:
+    """v10 Fix 1: import sanity check preserves cd subdir && ... semantics."""
+
+    def test_cd_subdir_import_check_passes(self, tmp_path: Path) -> None:
+        """Import check with 'cd app && python -m ...' should cd into app."""
+        from researchclaw.ahvs.executor import _run_import_sanity_check
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        # Create module inside a subdirectory
+        app = repo / "app"
+        app.mkdir()
+        pkg = app / "mypkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "run_eval.py").write_text("print('ok')\n")
+        subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add app"],
+            cwd=str(repo), capture_output=True, check=True,
+        )
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        # This command uses cd to change into app/ before running python
+        result = _run_import_sanity_check(
+            wt, "cd app && python3 -m mypkg.run_eval --eval-only"
+        )
+        assert result is None  # should pass — cd app is preserved
+        wt.cleanup()
+
+    def test_cd_subdir_import_fails_without_cd(self, tmp_path: Path) -> None:
+        """Without cd, the module would not be importable from repo root."""
+        from researchclaw.ahvs.executor import _run_import_sanity_check
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        app = repo / "app"
+        app.mkdir()
+        pkg = app / "mypkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "run_eval.py").write_text("print('ok')\n")
+        subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add app"],
+            cwd=str(repo), capture_output=True, check=True,
+        )
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        # Without cd app, mypkg is not importable from repo root
+        result = _run_import_sanity_check(
+            wt, "python3 -m mypkg.run_eval --eval-only"
+        )
+        assert result is not None  # should fail — mypkg not at repo root
+        wt.cleanup()
+
+    def test_parsed_cd_dir_preserved(self) -> None:
+        """_find_python_and_module extracts cd_dir correctly."""
+        from researchclaw.ahvs.executor import _find_python_and_module
+
+        result = _find_python_and_module(
+            "cd /path/to/project && PYTHONPATH=src python3 -m pkg.eval"
+        )
+        assert result is not None
+        assert result.cd_dir == "/path/to/project"
+        assert result.python_exe == "python3"
+        assert result.module_name == "pkg.eval"
