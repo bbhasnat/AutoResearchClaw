@@ -44,6 +44,9 @@ class AHVSConfig:
     llm_model: str = "claude-opus-4-6"
     llm_api_key_env: str = "ANTHROPIC_API_KEY"
 
+    # ── Claude Code agent (replaces CodeAgent for AHVS code_change) ──
+    use_claude_code: bool = False  # use `claude` CLI instead of CodeAgent
+
     # ── ACP settings (only used when llm_provider == "acp") ───────────
     acp_agent: str = "claude"
     acp_cwd: str = "."           # resolved to repo_path in __post_init__
@@ -102,6 +105,7 @@ class AHVSConfig:
             ),
             allow_sandbox_only=getattr(args, "allow_sandbox_only", False),
             apply_best=getattr(args, "apply_best", False),
+            use_claude_code=getattr(args, "use_claude_code", False),
             llm_provider=getattr(args, "provider", "anthropic") or "anthropic",
             llm_base_url=getattr(args, "base_url", "") or "",
             llm_model=getattr(args, "model", "claude-opus-4-6") or "claude-opus-4-6",

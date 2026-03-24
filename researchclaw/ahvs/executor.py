@@ -306,6 +306,206 @@ def _remap_root_file(basename: str, repo_path: "Path") -> str | None:
     return None
 
 
+def _generate_files_with_claude_code(
+    hyp: dict[str, Any],
+    hyp_id: str,
+    config: "AHVSConfig",
+    baseline: dict[str, Any],
+    work_dir: Path,
+) -> dict[str, str]:
+    """Use Claude Code CLI to make targeted file edits for a hypothesis.
+
+    Instead of the full CodeAgent pipeline (blueprint → generate → sandbox),
+    this invokes ``claude -p`` with a focused prompt that reads the target
+    file and applies the specific change described in the hypothesis.
+
+    Returns a dict mapping relative file paths → modified file content,
+    matching the ``CodeAgentResult.files`` interface.
+    """
+    import json as _json
+    import shutil
+    import subprocess
+
+    claude_bin = shutil.which("claude")
+    if claude_bin is None:
+        raise RuntimeError(
+            "claude CLI not found — install Claude Code or set use_claude_code=False"
+        )
+
+    description = hyp.get("description", "")
+    hyp_type = hyp.get("type", "code_change")
+    metric_name = baseline["primary_metric"]
+    baseline_value = baseline["value"]
+    eval_command = baseline.get("eval_command", "")
+
+    # Collect repo source files for context
+    src_files = sorted(
+        str(p.relative_to(config.repo_path))
+        for p in config.repo_path.rglob("*.py")
+        if ".ahvs" not in p.parts
+        and "__pycache__" not in p.parts
+        and ".git" not in p.parts
+        and "autoresearch" not in p.parts
+    )
+    file_listing = "\n".join(f"- {f}" for f in src_files[:30])
+
+    prompt = (
+        f"You are making a targeted code change to improve the metric "
+        f"'{metric_name}' (current baseline: {baseline_value}).\n\n"
+        f"## Hypothesis {hyp_id}\n"
+        f"**Type:** {hyp_type}\n"
+        f"**Description:** {description}\n\n"
+        f"## Target Repository\n"
+        f"Path: {config.repo_path}\n\n"
+        f"## Existing source files:\n{file_listing}\n\n"
+        f"## Eval command (how the metric is measured):\n"
+        f"```\n{eval_command}\n```\n\n"
+        f"## Instructions\n"
+        f"1. Read the target file(s) mentioned in the hypothesis description.\n"
+        f"2. Make ONLY the specific change described. Do NOT rewrite the entire "
+        f"file. Do NOT add unrelated code.\n"
+        f"3. Preserve all existing functions, classes, constants, and imports "
+        f"that you are not explicitly changing.\n"
+        f"4. Do NOT modify run_eval.py, evaluation.py, or test files.\n"
+        f"5. Do NOT create standalone scripts (main.py, config.py, etc.).\n"
+        f"6. After making edits, output a JSON summary of what you changed.\n\n"
+        f"Make the change now. Read the file first, then edit it."
+    )
+
+    system_prompt = (
+        "You are a senior developer making a surgical code edit to an existing "
+        "codebase. You use the Read tool to examine files, then the Edit tool "
+        "to make minimal, targeted changes. You NEVER rewrite entire files. "
+        "You NEVER create new standalone scripts. You modify only what the "
+        "hypothesis requires and nothing else."
+    )
+
+    logger.info(
+        "%s: invoking Claude Code CLI for targeted edit (use_claude_code=True)",
+        hyp_id,
+    )
+    print(f"[AHVS] {hyp_id}: using Claude Code for targeted file edit")
+
+    try:
+        result = subprocess.run(
+            [
+                claude_bin, "-p",
+                "--model", "sonnet",
+                "--output-format", "json",
+                "--system-prompt", system_prompt,
+                "--allowedTools", "Read", "Edit", "Glob", "Grep", "Bash(git diff:*)",
+                "--dangerously-skip-permissions",
+                "--no-session-persistence",
+                "--max-budget-usd", "0.50",
+                "--add-dir", str(config.repo_path),
+            ],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=str(config.repo_path),
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("%s: Claude Code CLI timed out after 300s", hyp_id)
+        return {}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("%s: Claude Code CLI failed: %s", hyp_id, exc)
+        return {}
+
+    if result.returncode != 0:
+        logger.warning(
+            "%s: Claude Code CLI exited %d — stderr: %s",
+            hyp_id, result.returncode, result.stderr[:500],
+        )
+
+    # Collect modified files by checking git status in the repo.
+    # Claude Code edits files in-place, so we detect changes via git
+    # and capture the modified content before reverting.
+    #
+    # Note: config.repo_path may be a subdirectory of the git root
+    # (e.g., /repo/autoqa while git root is /repo). We need to:
+    # 1. Find the git root
+    # 2. Run git commands from there
+    # 3. Convert git-relative paths to repo_path-relative paths
+    try:
+        git_root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True,
+            cwd=str(config.repo_path),
+        )
+        git_root = Path(git_root_result.stdout.strip())
+        # repo_path relative to git root (e.g., "autoqa")
+        try:
+            repo_prefix = config.repo_path.relative_to(git_root)
+        except ValueError:
+            repo_prefix = Path(".")
+
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True,
+            cwd=str(git_root),
+        )
+        # changed_git: paths relative to git root
+        # changed_repo: paths relative to repo_path (what the framework expects)
+        changed_git: list[str] = []
+        changed_repo: list[str] = []
+        for line in status_result.stdout.strip().splitlines():
+            if not line or len(line) < 4:
+                continue
+            # Porcelain v1 format: "XY <path>" where XY is 2-char status.
+            # Robust extraction: split on whitespace, take everything
+            # after the status prefix.
+            parts = line.split(maxsplit=1)
+            if len(parts) < 2:
+                continue
+            status_code = parts[0]  # e.g. "M", "AM", "??"
+            git_path = parts[1].strip()
+            if (
+                any(c in status_code for c in "MA")
+                and git_path.endswith(".py")
+            ):
+                changed_git.append(git_path)
+                try:
+                    repo_rel = str(Path(git_path).relative_to(repo_prefix))
+                    changed_repo.append(repo_rel)
+                except ValueError:
+                    changed_git.pop()
+    except Exception:  # noqa: BLE001
+        git_root = config.repo_path
+        changed_git = []
+        changed_repo = []
+
+    files: dict[str, str] = {}
+    for repo_rel in changed_repo:
+        full_path = config.repo_path / repo_rel
+        if full_path.is_file():
+            files[repo_rel] = full_path.read_text(encoding="utf-8")
+
+    # Revert the repo to clean state — the worktree pipeline will apply
+    # the files from the dict, not from the working tree
+    if changed_git:
+        try:
+            subprocess.run(
+                ["git", "checkout", "--"] + changed_git,
+                cwd=str(git_root),
+                capture_output=True,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    logger.info(
+        "%s: Claude Code produced %d file(s): %s",
+        hyp_id, len(files), list(files.keys()),
+    )
+    print(f"[AHVS] {hyp_id}: Claude Code edited {len(files)} file(s): {list(files.keys())}")
+
+    # Save Claude Code output for debugging
+    log_path = work_dir / "claude_code_output.json"
+    log_path.write_text(result.stdout[:50000], encoding="utf-8")
+
+    return files
+
+
 def _is_warn_file(relpath: str) -> str | None:
     """Return a warning string if *relpath* is a sensitive file, else None.
 
@@ -1676,40 +1876,53 @@ def _run_single_hypothesis(
         worktree = None
 
     try:
-        llm = _make_llm_client(config)
-        pm = PromptManager()
-        agent_cfg = CodeAgentConfig(
-            enabled=True,
-            architecture_planning=True,
-            sequential_generation=True,
-            hard_validation=True,
-            exec_fix_max_iterations=2,
-            tree_search_enabled=False,
-            review_max_rounds=1,
-            preserve_paths=True,
-        )
-        sandbox_factory = _make_sandbox_factory(config)
+        # ── Choose code generation backend ────────────────────────
+        if config.use_claude_code:
+            # Claude Code CLI: targeted file edits via Read/Edit tools
+            generated_files = _generate_files_with_claude_code(
+                hyp=hyp,
+                hyp_id=hyp_id,
+                config=config,
+                baseline=baseline,
+                work_dir=work_dir,
+            )
+        else:
+            # Legacy CodeAgent: full 5-phase pipeline
+            llm = _make_llm_client(config)
+            pm = PromptManager()
+            agent_cfg = CodeAgentConfig(
+                enabled=True,
+                architecture_planning=True,
+                sequential_generation=True,
+                hard_validation=True,
+                exec_fix_max_iterations=2,
+                tree_search_enabled=False,
+                review_max_rounds=1,
+                preserve_paths=True,
+            )
+            sandbox_factory = _make_sandbox_factory(config)
 
-        agent = CodeAgent(
-            llm=llm,
-            prompts=pm,
-            config=agent_cfg,
-            stage_dir=work_dir,
-            sandbox_factory=sandbox_factory,
-        )
+            agent = CodeAgent(
+                llm=llm,
+                prompts=pm,
+                config=agent_cfg,
+                stage_dir=work_dir,
+                sandbox_factory=sandbox_factory,
+            )
 
-        agent_result = agent.generate(
-            topic=f"AHVS hypothesis {hyp_id}: {hyp.get('description', '')}",
-            exp_plan=problem,
-            metric=metric_name,
-            pkg_hint=pkg_hint,
-            max_tokens=16384,
-        )
+            agent_result = agent.generate(
+                topic=f"AHVS hypothesis {hyp_id}: {hyp.get('description', '')}",
+                exp_plan=problem,
+                metric=metric_name,
+                pkg_hint=pkg_hint,
+                max_tokens=16384,
+            )
+            generated_files = agent_result.files
 
         # Write generated files to work_dir (with path validation)
         from researchclaw.ahvs.worktree import validate_safe_relpath
 
-        for filename, content in agent_result.files.items():
+        for filename, content in generated_files.items():
             validate_safe_relpath(filename, work_dir)
             fpath = (work_dir / filename).resolve()
             fpath.parent.mkdir(parents=True, exist_ok=True)
@@ -1725,7 +1938,7 @@ def _run_single_hypothesis(
         # match exists under src/ to avoid ambiguity.
         _repo_has_src = (config.repo_path / "src").is_dir()
         remapped_files: dict[str, str] = {}
-        for filename, content in agent_result.files.items():
+        for filename, content in generated_files.items():
             from pathlib import PurePosixPath as _PP
             _p = _PP(filename)
             if (
