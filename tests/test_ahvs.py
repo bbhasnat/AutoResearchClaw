@@ -2934,7 +2934,7 @@ class TestFindPythonAndModule:
         assert result is not None
         assert result.python_exe == "/usr/bin/python3"
         assert result.module_name == "autoqa.run_eval"
-        assert "PYTHONPATH=src:$PYTHONPATH" in result.env_vars
+        assert "PYTHONPATH=src:$PYTHONPATH" in result.env_prefix
 
     def test_cd_and_python(self) -> None:
         from researchclaw.ahvs.executor import _find_python_and_module
@@ -2954,7 +2954,20 @@ class TestFindPythonAndModule:
         assert result is not None
         assert result.python_exe == "python3"
         assert result.module_name == "my_pkg.eval"
-        assert len(result.env_vars) == 2
+        assert "PYTHONPATH=" in result.env_prefix
+        assert "CUDA_VISIBLE_DEVICES=" in result.env_prefix
+
+    def test_quoted_env_var_preserved(self) -> None:
+        """v11 fix: quoted env var values must be preserved verbatim."""
+        from researchclaw.ahvs.executor import _find_python_and_module
+        result = _find_python_and_module(
+            'FOO="a b" python3 -m mypkg.run_eval --eval-only'
+        )
+        assert result is not None
+        assert result.python_exe == "python3"
+        assert result.module_name == "mypkg.run_eval"
+        # The raw env prefix must preserve the original quoting
+        assert 'FOO="a b"' in result.env_prefix
 
     def test_no_m_flag_returns_none(self) -> None:
         from researchclaw.ahvs.executor import _find_python_and_module
@@ -3144,3 +3157,37 @@ class TestImportCheckCdSemantics:
         assert result.cd_dir == "/path/to/project"
         assert result.python_exe == "python3"
         assert result.module_name == "pkg.eval"
+
+
+class TestImportCheckQuotedEnvVars:
+    """v11 fix: quoted env vars must not break the import sanity check."""
+
+    def test_quoted_env_var_does_not_break_check(self, tmp_path: Path) -> None:
+        """Import check with FOO='a b' prefix must not produce invalid shell."""
+        from researchclaw.ahvs.executor import _run_import_sanity_check
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        pkg = repo / "mypkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "run_eval.py").write_text("print('ok')\n")
+        subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add pkg"],
+            cwd=str(repo), capture_output=True, check=True,
+        )
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        # This previously broke: shlex.split consumed the quotes, then
+        # reconstruction produced FOO=a b python3 -c ... (invalid shell)
+        result = _run_import_sanity_check(
+            wt, 'FOO="a b" python3 -m mypkg.run_eval --eval-only'
+        )
+        assert result is None  # should pass, not fail with shell error
+        wt.cleanup()

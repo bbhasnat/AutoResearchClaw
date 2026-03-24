@@ -288,19 +288,22 @@ def _is_warn_file(relpath: str) -> str | None:
 class _ParsedEvalCommand:
     """Result of parsing an eval_command into its components."""
 
-    __slots__ = ("python_exe", "module_name", "cd_dir", "env_vars")
+    __slots__ = ("python_exe", "module_name", "cd_dir", "env_prefix")
 
     def __init__(
         self,
         python_exe: str,
         module_name: str,
         cd_dir: str | None = None,
-        env_vars: list[str] | None = None,
+        env_prefix: str = "",
     ) -> None:
         self.python_exe = python_exe
         self.module_name = module_name
         self.cd_dir = cd_dir
-        self.env_vars = env_vars or []
+        # Raw env prefix extracted verbatim from the command string —
+        # never reconstructed from parsed tokens, so shell quoting is
+        # preserved exactly as the operator wrote it.
+        self.env_prefix = env_prefix
 
 
 def _find_python_and_module(eval_command: str) -> _ParsedEvalCommand | None:
@@ -311,10 +314,11 @@ def _find_python_and_module(eval_command: str) -> _ParsedEvalCommand | None:
       - ``/path/to/python -m pkg.mod ...``
       - ``PYTHONPATH=src:$PYTHONPATH python -m pkg.mod ...``
       - ``cd /path && python -m pkg.mod ...``
-      - ``VAR=val VAR2=val2 python -m pkg.mod ...``
+      - ``FOO="a b" python -m pkg.mod ...``
 
     Returns a ``_ParsedEvalCommand`` with the python executable, module
-    name, optional ``cd`` target directory, and any env var assignments.
+    name, optional ``cd`` target directory, and the raw env prefix string
+    (preserved verbatim to avoid shell-quoting issues).
     Returns None if the pattern is not recognizable.
     """
     # Extract cd target from chained commands before splitting
@@ -324,34 +328,29 @@ def _find_python_and_module(eval_command: str) -> _ParsedEvalCommand | None:
     for sep in ("&&", ";"):
         if sep in eval_command:
             segments = eval_command.split(sep)
-            # Look for cd in earlier segments
             for segment in segments:
                 stripped = segment.strip()
                 if stripped.startswith("cd "):
                     cd_parts = stripped.split(None, 1)
                     if len(cd_parts) == 2:
                         cd_dir = cd_parts[1].strip()
-            # Take the segment with -m as the python invocation
             for segment in reversed(segments):
                 if "-m" in segment:
                     python_segment = segment.strip()
                     break
             break
 
-    # Tokenize the python segment
+    # Tokenize to find -m and the python executable
     import shlex
     try:
         parts = shlex.split(python_segment)
     except ValueError:
         parts = python_segment.split()
 
-    # Collect env var assignments and find -m
-    env_vars: list[str] = []
+    # Find -m and the module name
     module_name = None
     m_index = None
     for i, part in enumerate(parts):
-        if "=" in part and m_index is None:
-            env_vars.append(part)
         if part == "-m" and i + 1 < len(parts):
             module_name = parts[i + 1]
             m_index = i
@@ -360,8 +359,7 @@ def _find_python_and_module(eval_command: str) -> _ParsedEvalCommand | None:
     if module_name is None or m_index is None:
         return None
 
-    # The Python executable is the token immediately before -m.
-    # Skip env var assignments (KEY=VALUE) that precede it.
+    # Find the Python executable (token before -m, skipping env vars)
     python_exe = None
     if m_index > 0:
         candidate = parts[m_index - 1]
@@ -380,11 +378,20 @@ def _find_python_and_module(eval_command: str) -> _ParsedEvalCommand | None:
     if python_exe is None:
         return None
 
+    # Extract env prefix VERBATIM from the raw command string.
+    # Find where the python executable starts in the raw string and
+    # take everything before it.  This preserves shell quoting exactly
+    # as the operator wrote it (e.g. FOO="a b" stays as FOO="a b").
+    env_prefix = ""
+    exe_pos = python_segment.find(python_exe)
+    if exe_pos > 0:
+        env_prefix = python_segment[:exe_pos]
+
     return _ParsedEvalCommand(
         python_exe=python_exe,
         module_name=module_name,
         cd_dir=cd_dir,
-        env_vars=env_vars,
+        env_prefix=env_prefix,
     )
 
 
@@ -400,7 +407,8 @@ def _run_import_sanity_check(
 
     Preserves wrapper semantics:
     - ``cd subdir && python -m ...`` → import check runs from ``subdir``
-    - ``PYTHONPATH=src:$PYTHONPATH ...`` → env vars are preserved
+    - ``PYTHONPATH=src:$PYTHONPATH ...`` → env prefix preserved verbatim
+    - ``FOO="a b" python -m ...`` → quoted env vars preserved as-is
     - Non-Python commands (bash scripts) → check is skipped gracefully
 
     Returns None if the check passes or is skipped, or an error string if
@@ -414,18 +422,17 @@ def _run_import_sanity_check(
         )
         return None
 
-    # Reconstruct a faithful import check that preserves the original
-    # command's cwd and environment semantics.
-    env_prefix = " ".join(parsed.env_vars) + " " if parsed.env_vars else ""
-    # Always include PYTHONPATH=src if not already in env_vars
-    if not any(v.startswith("PYTHONPATH=") for v in parsed.env_vars):
+    # Use the raw env prefix from the original command — no reconstruction
+    # from parsed tokens, so shell quoting is preserved exactly.
+    env_prefix = parsed.env_prefix
+    # Ensure PYTHONPATH=src is present if not already in the prefix
+    if "PYTHONPATH=" not in env_prefix:
         env_prefix = f"PYTHONPATH=src:$PYTHONPATH {env_prefix}"
 
     import_stmt = f"import {parsed.module_name}"
     python_part = f'{env_prefix}{parsed.python_exe} -c "{import_stmt}"'
 
-    # Preserve cd semantics: if the original command had `cd subdir && ...`,
-    # prepend it so the import check runs from the same working directory.
+    # Preserve cd semantics from the original command
     if parsed.cd_dir:
         check_cmd = f"cd {parsed.cd_dir} && {python_part}"
     else:
