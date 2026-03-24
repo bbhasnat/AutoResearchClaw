@@ -363,7 +363,7 @@ def run_selector(
     cycle_dir: Path,
     *,
     question: str = "",
-    port: int = 0,
+    port: int = 8765,
     open_browser: bool = True,
 ) -> list[str]:
     """Serve the hypothesis selection GUI and return the chosen IDs.
@@ -373,7 +373,7 @@ def run_selector(
     Args:
         cycle_dir: Path to the AHVS cycle directory containing hypotheses.md.
         question: Cycle question string (displayed in the UI).
-        port: Port to listen on. 0 = OS assigns a free port.
+        port: Port to listen on. Default 8765. 0 = OS assigns a free port.
         open_browser: If True, open the default browser automatically.
 
     Returns:
@@ -408,13 +408,16 @@ def run_selector(
     html_content = _build_html(hypotheses, cycle_dir, question)
     handler_class = _make_handler(html_content, state)
 
-    server = HTTPServer(("127.0.0.1", port), handler_class)
+    server = HTTPServer(("0.0.0.0", port), handler_class)
     actual_port = server.server_address[1]
 
     url = f"http://127.0.0.1:{actual_port}/"
-    print(f"[selector] Serving hypothesis selection UI at {url}")
-    print(f"[selector] {len(hypotheses)} hypotheses: {[h['id'] for h in hypotheses]}")
-    print("[selector] Waiting for human selection...")
+    print(f"\n{'='*60}")
+    print(f"  HYPOTHESIS SELECTOR — http://localhost:{actual_port}/")
+    print(f"{'='*60}")
+    print(f"  {len(hypotheses)} hypotheses: {[h['id'] for h in hypotheses]}")
+    print(f"  Waiting for your selection... (submit in browser)")
+    print(f"{'='*60}\n")
 
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
