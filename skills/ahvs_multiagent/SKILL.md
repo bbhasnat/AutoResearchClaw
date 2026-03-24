@@ -25,7 +25,7 @@ This skill orchestrates a full AHVS hypothesis-validation cycle using three coor
 2. Presents them in a browser GUI for human selection (or auto-approves)
 3. Creates an agent team with executor (sonnet) and observer (opus)
 4. Runs each selected hypothesis one at a time — executor runs it, observer verifies
-5. Re-runs hypotheses that failed due to framework bugs (after observer fixes them)
+5. Re-runs hypotheses that failed due to framework bugs (after observer fixes and lead commits)
 6. Archives results (Stages 7–8) and shuts down the team
 
 ## What This Skill Does NOT Do
@@ -61,6 +61,7 @@ The skill needs these values. Extract them from the user's message, CLAUDE.md, o
 | `MODEL` | LLM model | `anthropic/claude-opus-4-6` |
 | `API_KEY_ENV` | Env var name holding the API key | `OPENROUTER_API_KEY` |
 | `AUTO_APPROVE` | Skip GUI selection? | `false` (default) |
+| `COMMIT_FIX` | Commit observer fixes to git? | `true` (default) |
 
 ## The 5-Phase Flow
 
@@ -175,8 +176,9 @@ SendMessage:
     Verify {H_ID} result.
     Result dir: {REPO_PATH}/.ahvs/cycles/{CYCLE_ID}/tool_runs/{H_ID}/
     Log: /tmp/ahvs_{H_ID}.log
-    Classify as FRAMEWORK_BUG, HYPOTHESIS_MISS, or AMBIGUOUS.
-    If FRAMEWORK_BUG: fix it (pytest gate required), then report RERUN_NEEDED.
+    Classify as FRAMEWORK_BUG (Subcategory A or B), HYPOTHESIS_MISS, or AMBIGUOUS.
+    If FRAMEWORK_BUG: fix it (pytest gate required), then report fix details
+    and RERUN_NEEDED. Do NOT commit — I will handle that.
     If HYPOTHESIS_MISS: record lesson, report PASS.
     If AMBIGUOUS: escalate to me with evidence.
 ```
@@ -188,16 +190,55 @@ Wait for observer to respond.
 | Observer says | Action |
 |---|---|
 | **PASS** (hypothesis miss or metric improved) | Move to next hypothesis |
-| **RERUN_NEEDED** (framework bug was fixed) | Go back to Step A for same H_ID |
+| **RERUN_NEEDED** (framework bug was fixed) | Go to Step C1: Review and commit fix |
 | **AMBIGUOUS** | Read observer's evidence, make a decision, then PASS or RERUN |
 
 Track re-run count per hypothesis. If the same hypothesis needs re-running more than 3 times, escalate to the human — something deeper is wrong.
+
+#### Step C1: Review and commit observer's fix
+
+When the observer reports RERUN_NEEDED with fix details:
+
+1. **Review the fix** — read the diff of changed files:
+   ```bash
+   cd {ARC_DIR} && git diff
+   ```
+
+2. **If the fix looks correct and COMMIT_FIX is true:**
+   ```bash
+   cd {ARC_DIR} && \
+   git add <files the observer changed> && \
+   git commit -m "fix: <observer's description of what was fixed>"
+   ```
+   Tell the user: "Committed observer fix: <description>. Re-running {H_ID}."
+
+3. **If the fix looks correct but COMMIT_FIX is false:**
+   Tell the user: "Observer fixed <description> (uncommitted). Re-running {H_ID}."
+
+4. **If the fix looks wrong:**
+   Revert it: `cd {ARC_DIR} && git checkout -- <files>`
+   Ask the observer to try a different approach, or escalate to user.
+
+5. **Re-run the hypothesis** — go back to Step A for the same H_ID.
+
+6. **If executor fails after the fix** (errors referencing old behavior, stale state):
+   The committed code is picked up by fresh `python -m researchclaw` processes,
+   so executor CLI commands should work. But if the executor agent itself has
+   stale context:
+   a. Shut down the executor: `SendMessage: to="executor", message="Shutdown."`
+   b. Respawn a fresh executor with the same prompt from `references/agent_prompts.md`
+   c. Send the re-run command to the new executor
 
 #### Step D: Report progress
 
 After each hypothesis completes, tell the user:
 ```
 "{H_ID} complete — {outcome}. {N_remaining} hypotheses remaining."
+```
+
+If a framework fix was committed, include:
+```
+"Framework fix committed: {commit_hash} — {description}"
 ```
 
 ### Phase 5 — Archive and Shutdown
@@ -226,7 +267,7 @@ TeamDelete
 Report to the user:
 ```
 "Done. {kept}/{total} hypotheses improved metric.
- {bugs_fixed} framework bugs found and fixed.
+ {bugs_fixed} framework bugs found and fixed ({bugs_committed} committed).
  Report: {REPO_PATH}/.ahvs/cycles/{CYCLE_ID}/report.md"
 ```
 
@@ -247,8 +288,9 @@ Read `references/failure_classification.md` for the full rules. Summary:
 
 | Type | Meaning | Who fixes | Re-run? |
 |---|---|---|---|
-| FRAMEWORK_BUG | AHVS framework code is broken | Observer | Yes |
-| HYPOTHESIS_MISS | Hypothesis ran fine, metric didn't improve | Nobody | No |
+| FRAMEWORK_BUG (A) | Direct code bug in researchclaw/ | Observer fixes, lead commits | Yes |
+| FRAMEWORK_BUG (B) | Missing guardrail set hypothesis up to fail | Observer fixes, lead commits | Yes |
+| HYPOTHESIS_MISS | Hypothesis had a fair chance, metric didn't improve | Nobody | No |
 | AMBIGUOUS | Can't tell from logs | Lead decides | Maybe |
 
 ## Error Handling
@@ -259,7 +301,9 @@ Read `references/failure_classification.md` for the full rules. Summary:
 | GUI times out or user closes browser | Ask user if they want to retry or auto-approve |
 | Executor crashes mid-hypothesis | Ask observer to classify, then re-run or skip |
 | Observer fix breaks tests | Observer reverts, escalates to lead |
+| Observer fix looks wrong to lead | Lead reverts, asks observer to try differently |
 | Same hypothesis fails 3+ times | Stop loop, escalate to human |
+| Executor has stale state after fix | Lead shuts down and respawns executor |
 | Archive stage fails | Show error, but hypotheses results are already saved |
 
 ## Reference Files
@@ -267,4 +311,4 @@ Read `references/failure_classification.md` for the full rules. Summary:
 Read these when spawning agents — they contain the full prompts and rules:
 
 - `references/agent_prompts.md` — Executor and observer agent prompts (read before Phase 3)
-- `references/failure_classification.md` — Full classification rules, pytest gate procedure, memory write requirements
+- `references/failure_classification.md` — Full classification rules, pytest gate procedure, commit-after-fix flow, memory write requirements

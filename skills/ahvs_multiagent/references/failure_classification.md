@@ -60,9 +60,13 @@ before creating new ones. This is no longer a failure mode.
 ### FRAMEWORK_BUG
 
 A genuine bug in the AHVS framework code that prevented the hypothesis
-from getting a fair evaluation.
+from getting a fair evaluation. This includes two subcategories:
 
-**Indicators — these are real framework issues:**
+#### Subcategory A: Direct code bugs
+
+Errors in `researchclaw/` code itself.
+
+**Indicators:**
 - `ImportError` or `ModuleNotFoundError` in `researchclaw/` code (not target repo code)
 - Worktree creation itself fails (not just the import check after file apply)
 - `EvolutionStore` or `ContextLoader` crashes during Stage 2 or 7
@@ -70,30 +74,70 @@ from getting a fair evaluation.
 - Checkpoint write/read corruption preventing stage resume
 - AST splice produces invalid Python on valid input (the splicing logic itself is buggy)
 
+#### Subcategory B: Missing guardrails
+
+The framework failed to provide adequate context, filtering, or enforcement
+to give the hypothesis a fair chance. The hypothesis idea was valid but the
+framework set it up to fail.
+
+**Indicators — these are missing-guardrail issues:**
+- CodeAgent writes files to repo root (e.g., `parsing.py`) when source code
+  lives under a subdirectory (e.g., `src/autoqa/parsing.py`) — the framework
+  did not inject the source directory path or enforce correct paths
+- `prompt_rewrite` hypothesis generated when `eval_command` uses `--eval-only`
+  — structurally unmeasurable, the framework should have filtered this type
+  at generation time
+- Hypothesis description references a file by basename without full path
+  because the hypothesis generation prompt had no repo file tree context
+- ≥2 hypotheses in the same cycle fail with the same root cause (e.g., all
+  wrote to wrong paths) — systemic pattern, not individual hypothesis error
+
+**How to distinguish from HYPOTHESIS_MISS:**
+
+| Question | If YES → | If NO → |
+|---|---|---|
+| Did the framework tell CodeAgent the correct source directory? | HYPOTHESIS_MISS | FRAMEWORK_BUG (missing guardrail) |
+| Did the framework filter out unmeasurable hypothesis types? | HYPOTHESIS_MISS | FRAMEWORK_BUG (missing guardrail) |
+| Did the hypothesis gen prompt include the repo file tree? | HYPOTHESIS_MISS | FRAMEWORK_BUG (missing guardrail) |
+| Was the CodeAgent given adequate context to place files correctly? | HYPOTHESIS_MISS | FRAMEWORK_BUG (missing guardrail) |
+
+**Key insight:** If the framework had a guardrail that SHOULD exist but DOESN'T,
+and that missing guardrail caused the failure, it's a FRAMEWORK_BUG — even though
+the error manifests in CodeAgent output, not in `researchclaw/` stack traces.
+
 **NOT a FRAMEWORK_BUG (common misclassifications):**
-- `ImportError` in the target repo after CodeAgent changes → HYPOTHESIS_MISS
+- `ImportError` in the target repo after CodeAgent changes when CodeAgent was
+  given correct path context → HYPOTHESIS_MISS
 - Files blocked by forbidden file filter → HYPOTHESIS_MISS (intentional protection)
-- Pre-eval import check failure → HYPOTHESIS_MISS (CodeAgent broke imports)
-- `extraction_failed` when eval_command is configured → HYPOTHESIS_MISS (eval didn't produce metric)
-- eval_command crashes after CodeAgent rewrote a core module → HYPOTHESIS_MISS
+- Pre-eval import check failure when CodeAgent had correct context → HYPOTHESIS_MISS
+- `extraction_failed` when eval_command is configured and CodeAgent had adequate
+  context → HYPOTHESIS_MISS
+- eval_command crashes after CodeAgent rewrote a core module with correct paths
+  → HYPOTHESIS_MISS
 
-**Action:** Observer fixes the framework code, runs pytest gate, reports RERUN_NEEDED.
+**Action for Subcategory A:** Observer fixes the framework code, runs pytest
+gate, reports fix details to team lead. Team lead decides whether to commit.
+Reports RERUN_NEEDED.
 
-**Key insight:** Only classify as FRAMEWORK_BUG when the issue is in `researchclaw/`
-code, not in the hypothesis-generated code or the target repository.
+**Action for Subcategory B:** Observer implements the missing guardrail in the
+framework code (e.g., adds source dir detection to executor.py, adds
+prompt_rewrite filtering to hypothesis gen, injects repo file tree into prompts),
+runs pytest gate, reports fix details to team lead. Team lead decides whether
+to commit. Reports RERUN_NEEDED.
 
 ### HYPOTHESIS_MISS
 
-The hypothesis was given a fair chance but didn't improve the metric. This
-includes cases where CodeAgent's code was incompatible with the eval pipeline.
+The hypothesis was given a fair chance — with adequate context, correct paths,
+and a measurable hypothesis type — but didn't improve the metric.
 
 **Indicators:**
 - Metric measured but at or below baseline
 - Metric regressed (negative delta)
-- `extraction_failed` because CodeAgent broke imports (pre-eval check failed)
+- `extraction_failed` because CodeAgent broke imports despite having correct
+  path context (pre-eval check failed)
 - `extraction_failed` because eval_command crashed on hypothesis-generated code
+  that was correctly placed
 - All CodeAgent files were blocked by forbidden file filter (bad hypothesis strategy)
-- `prompt_rewrite` hypothesis with `--eval-only` eval_command (structurally unmeasurable)
 
 **Action:** Record the lesson. Report PASS. Move on.
 
@@ -112,6 +156,7 @@ The logs don't make it clear whether the issue is framework or hypothesis.
 - Error in a shared dependency that could be either framework or hypothesis
 - Worktree exists but eval produces unexpected output format (parsing issue?)
 - Metric present but suspiciously identical to baseline with code_change hypothesis
+  (could be wrong paths OR genuinely no-impact change)
 
 **Action:** Escalate to the team lead with:
 1. The specific log lines that are ambiguous
@@ -120,9 +165,55 @@ The logs don't make it clear whether the issue is framework or hypothesis.
 
 The lead makes the final call.
 
+---
+
+## Commit-After-Fix Procedure
+
+When `COMMIT_FIX` is `true` (default), every framework fix follows this flow:
+
+### 1. Observer fixes and passes pytest gate (see below)
+
+### 2. Observer reports to team lead
+
+The report must include:
+- Classification (FRAMEWORK_BUG subcategory A or B)
+- Root cause description
+- Files changed (with a summary of each change)
+- Pytest result: N/N passing
+- Recommendation: RERUN_NEEDED
+
+### 3. Team lead reviews and commits
+
+The team lead:
+a. Reads the diff: `git diff` on the changed files
+b. If satisfied, commits the fix:
+```bash
+cd {ARC_DIR} && \
+git add <changed files> && \
+git commit -m "fix: <description of what observer fixed>"
+```
+c. If not satisfied, asks the observer to revise or reverts
+
+### 4. Team lead tells executor to re-run
+
+Send the executor the re-run command. The executor runs AHVS CLI via Bash,
+which spawns a fresh Python process — it will pick up the committed code
+changes automatically.
+
+### 5. If executor fails to load new code
+
+If the executor reports errors that suggest it has stale state (e.g., referencing
+old behavior, failing on code that was just fixed), the team lead should:
+a. Shut down the executor agent
+b. Respawn a fresh executor with the same prompt from `agent_prompts.md`
+c. Send the re-run command to the new executor
+
+---
+
 ## Pytest Gate Procedure
 
 Every framework fix by the observer must pass through this gate. No exceptions.
+This applies to both Subcategory A and Subcategory B fixes.
 
 ### Before the fix
 
@@ -158,28 +249,31 @@ cd {ARC_DIR} && \
 3. **Escalate** to the team lead with both logs and an explanation of what went wrong
 4. **Do NOT** retry the fix without lead approval
 
+---
+
 ## Memory Write Requirements
 
 Every bug fix and every lesson must be written to memory **immediately** — not at
 end of session, not in batch, not "later."
 
-### For FRAMEWORK_BUG fixes, write all three:
+### For FRAMEWORK_BUG fixes (both subcategories), write all three:
 
 1. **Friction log**: `.ahvs/cycles/<cycle_id>/friction_log.md`
    ```markdown
    ## Operator Notes
 
    ### {timestamp} — {bug description}
-   - Classification: FRAMEWORK_BUG
+   - Classification: FRAMEWORK_BUG (Subcategory {A|B})
    - Root cause: {explanation}
    - Fix: {what was changed}
    - Tests: {pass count before} → {pass count after}
+   - Committed: {yes|no} (commit hash if yes)
    - Hypothesis affected: {H_ID}
    ```
 
 2. **Lessons JSONL**: `.ahvs/evolution/lessons.jsonl`
    ```json
-   {"type": "framework_bug", "description": "...", "fix": "...", "file": "...", "timestamp": "..."}
+   {"type": "framework_bug", "subcategory": "missing_guardrail", "description": "...", "fix": "...", "file": "...", "committed": true, "commit_hash": "...", "timestamp": "..."}
    ```
 
 3. **Claude memory**: `~/.claude/projects/-home-ubuntu-vision-AutoResearchClaw/memory/`
