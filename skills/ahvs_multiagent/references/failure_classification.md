@@ -3,36 +3,97 @@
 This reference defines how the observer classifies hypothesis execution outcomes
 and the exact procedure for handling each category.
 
+## Framework Protections (know these before classifying)
+
+The AHVS framework has several built-in protections that fire automatically
+during hypothesis execution. These are **features, not bugs** — do not try
+to "fix" them or classify them as FRAMEWORK_BUG.
+
+### Forbidden file filter
+
+The framework blocks CodeAgent from modifying eval-harness entry points.
+When you see `[AHVS] blocked N forbidden file(s)` in the logs, this is
+intentional protection working correctly.
+
+| File | Policy | Why |
+|---|---|---|
+| `run_eval.py` | Hard-blocked | Eval entry point — modifying it breaks the pipeline |
+| `evaluation.py` | Hard-blocked | Eval infrastructure |
+| `test_*.py`, `*_test.py` | Hard-blocked | Test files — never part of eval |
+| `__init__.py` | Warn-only (applied) | May be legitimate, logged for review |
+| `main.py` | Warn-only (applied) | May be legitimate, logged for review |
+
+If CodeAgent's only meaningful change was in a blocked file, the hypothesis
+will produce zero valid files and score `extraction_failed`. This is a
+**HYPOTHESIS_MISS** — the hypothesis strategy was incompatible with the
+framework's safety constraints.
+
+### Pre-eval import sanity check
+
+After applying CodeAgent's files to the worktree, the framework verifies
+the eval module can still import. When you see `pre-eval import check FAILED`
+in the logs, it means CodeAgent broke the module structure (circular imports,
+missing dependencies, syntax errors in spliced code).
+
+This is a **HYPOTHESIS_MISS** — CodeAgent produced code that broke the
+target repo's import chain. Do not classify as FRAMEWORK_BUG.
+
+### Authoritative eval policy
+
+When `eval_command` is configured, it is the **only trusted measurement
+source**. Sandbox self-reports (result.json written by CodeAgent, best_metrics,
+best_stdout) are unconditionally skipped. This prevents fabricated metrics.
+
+When you see `extraction_failed` with a configured `eval_command`, it means
+the real eval didn't produce a parseable metric. Do not look for the metric
+in sandbox artifacts — they were intentionally skipped.
+
+### Stale worktree cleanup
+
+The framework automatically removes stale worktrees from previous runs
+before creating new ones. This is no longer a failure mode.
+
+---
+
 ## The Three Categories
 
 ### FRAMEWORK_BUG
 
-The AHVS framework code itself is broken — the hypothesis never got a fair evaluation.
+A genuine bug in the AHVS framework code that prevented the hypothesis
+from getting a fair evaluation.
 
-**Indicators:**
-- `ImportError`, `ModuleNotFoundError` in AutoResearchClaw code
-- `FileNotFoundError` / `ENOENT` on framework paths (worktree dirs, eval_cwd)
-- Truncated CodeAgent output (partial JSON, cut-off mid-function)
-- `eval_command` crash that has nothing to do with hypothesis-generated code
-- Missing worktree subdirectory (Bug A pattern)
-- AST splice failure on valid code (Bug E pattern)
-- `eval_cwd` doesn't exist when `run_eval_command` is called (Bug C pattern)
+**Indicators — these are real framework issues:**
+- `ImportError` or `ModuleNotFoundError` in `researchclaw/` code (not target repo code)
+- Worktree creation itself fails (not just the import check after file apply)
+- `EvolutionStore` or `ContextLoader` crashes during Stage 2 or 7
+- LLM client connection failure (network error, API timeout) in AHVS orchestration
+- Checkpoint write/read corruption preventing stage resume
+- AST splice produces invalid Python on valid input (the splicing logic itself is buggy)
+
+**NOT a FRAMEWORK_BUG (common misclassifications):**
+- `ImportError` in the target repo after CodeAgent changes → HYPOTHESIS_MISS
+- Files blocked by forbidden file filter → HYPOTHESIS_MISS (intentional protection)
+- Pre-eval import check failure → HYPOTHESIS_MISS (CodeAgent broke imports)
+- `extraction_failed` when eval_command is configured → HYPOTHESIS_MISS (eval didn't produce metric)
+- eval_command crashes after CodeAgent rewrote a core module → HYPOTHESIS_MISS
 
 **Action:** Observer fixes the framework code, runs pytest gate, reports RERUN_NEEDED.
 
-**Key insight:** The hypothesis code might be brilliant — we'll never know unless the
-framework lets it run properly. That's why we fix and re-run.
+**Key insight:** Only classify as FRAMEWORK_BUG when the issue is in `researchclaw/`
+code, not in the hypothesis-generated code or the target repository.
 
 ### HYPOTHESIS_MISS
 
-The hypothesis ran correctly from start to finish. The metric was measured. It just
-didn't improve (or it regressed).
+The hypothesis was given a fair chance but didn't improve the metric. This
+includes cases where CodeAgent's code was incompatible with the eval pipeline.
 
 **Indicators:**
-- Exit code 0
-- Metric value is present and parseable
-- Metric is at or below baseline
-- No framework errors in the log
+- Metric measured but at or below baseline
+- Metric regressed (negative delta)
+- `extraction_failed` because CodeAgent broke imports (pre-eval check failed)
+- `extraction_failed` because eval_command crashed on hypothesis-generated code
+- All CodeAgent files were blocked by forbidden file filter (bad hypothesis strategy)
+- `prompt_rewrite` hypothesis with `--eval-only` eval_command (structurally unmeasurable)
 
 **Action:** Record the lesson. Report PASS. Move on.
 
@@ -48,10 +109,9 @@ what NOT to try. The observer must NOT:
 The logs don't make it clear whether the issue is framework or hypothesis.
 
 **Indicators:**
-- Partial output that could be either a framework truncation or bad hypothesis code
-- Error in a dependency that could be either framework or hypothesis
-- Metric present but suspiciously identical to baseline (possible eval-only run when
-  code changes were expected)
+- Error in a shared dependency that could be either framework or hypothesis
+- Worktree exists but eval produces unexpected output format (parsing issue?)
+- Metric present but suspiciously identical to baseline with code_change hypothesis
 
 **Action:** Escalate to the team lead with:
 1. The specific log lines that are ambiguous
@@ -68,21 +128,17 @@ Every framework fix by the observer must pass through this gate. No exceptions.
 
 ```bash
 cd {ARC_DIR} && \
-{PYTHON} -m pytest tests/ -v \
-  --ignore=tests/e2e_docker_sandbox.py \
-  --ignore=tests/e2e_real_llm.py \
+{PYTHON} -m pytest tests/test_ahvs.py -v \
   2>&1 | tee /tmp/pytest_before_fix.log
 ```
 
-Record the number of passing and failing tests. This is the baseline.
+Record the number of passing tests (currently 209). This is the baseline.
 
 ### After the fix
 
 ```bash
 cd {ARC_DIR} && \
-{PYTHON} -m pytest tests/ -v \
-  --ignore=tests/e2e_docker_sandbox.py \
-  --ignore=tests/e2e_real_llm.py \
+{PYTHON} -m pytest tests/test_ahvs.py -v \
   2>&1 | tee /tmp/pytest_after_fix.log
 ```
 
@@ -92,7 +148,7 @@ cd {ARC_DIR} && \
 |---|---|
 | All previously-passing tests still pass | Yes — zero regressions allowed |
 | No new test failures | Yes |
-| Relevant bug regression test passes | Yes (TestBugA_*, TestBugC_*, TestBugE_*) |
+| Full AHVS test suite passes (209 tests) | Yes |
 | New test added for the specific fix | Recommended but not blocking |
 
 ### If the gate fails
