@@ -220,11 +220,19 @@ _TYPE_EXECUTION_STRATEGIES: dict[str, dict[str, str]] = {
 # breaks the eval pipeline (circular imports, broken argparse, missing entry
 # points).  The prompt tells CodeAgent not to touch them; this filter
 # enforces it at the framework level.
+#
+# Hard-blocked: always rejected.
 _FORBIDDEN_BASENAMES: frozenset[str] = frozenset({
     "run_eval.py",
-    "__init__.py",
     "evaluation.py",
     "main.py",
+})
+
+# Warn-only: logged as a warning but still applied.  __init__.py is
+# needed for legitimate package-wiring changes, so we warn rather than
+# block to avoid false negatives on valid hypotheses.
+_WARN_BASENAMES: frozenset[str] = frozenset({
+    "__init__.py",
 })
 
 # Patterns for files that are always standalone scripts / test files
@@ -234,7 +242,11 @@ _FORBIDDEN_SUFFIXES: tuple[str, ...] = ("_test.py",)
 
 
 def _is_forbidden_file(relpath: str) -> str | None:
-    """Return a reason string if *relpath* is a forbidden file, else None."""
+    """Return a reason string if *relpath* should be hard-blocked, else None.
+
+    Files in ``_WARN_BASENAMES`` are NOT blocked — use
+    ``_is_warn_file()`` to check those separately.
+    """
     from pathlib import PurePosixPath
 
     basename = PurePosixPath(relpath).name
@@ -251,9 +263,92 @@ def _is_forbidden_file(relpath: str) -> str | None:
     return None
 
 
+def _is_warn_file(relpath: str) -> str | None:
+    """Return a warning string if *relpath* is a sensitive file, else None.
+
+    These files are applied but a warning is logged so operators can
+    diagnose unexpected eval failures.
+    """
+    from pathlib import PurePosixPath
+
+    basename = PurePosixPath(relpath).name
+    if basename in _WARN_BASENAMES:
+        return f"sensitive file modified: {basename} (may affect package structure)"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Pre-eval import sanity check
 # ---------------------------------------------------------------------------
+
+
+def _find_python_and_module(eval_command: str) -> tuple[str, str] | None:
+    """Extract the Python executable and module name from *eval_command*.
+
+    Supports common eval_command shapes:
+      - ``python -m pkg.mod ...``
+      - ``/path/to/python -m pkg.mod ...``
+      - ``PYTHONPATH=src:$PYTHONPATH python -m pkg.mod ...``
+      - ``cd /path && python -m pkg.mod ...``
+      - ``VAR=val VAR2=val2 python -m pkg.mod ...``
+
+    Returns ``(python_executable, module_name)`` or None if the pattern
+    is not recognizable.
+    """
+    # Split on && or ; to handle chained commands — take the last segment
+    # that contains "-m" (the actual Python invocation).
+    for sep in ("&&", ";"):
+        if sep in eval_command:
+            segments = eval_command.split(sep)
+            for segment in reversed(segments):
+                if "-m" in segment:
+                    eval_command = segment.strip()
+                    break
+            break
+
+    # Tokenize
+    import shlex
+    try:
+        parts = shlex.split(eval_command)
+    except ValueError:
+        parts = eval_command.split()
+
+    # Find -m and the module name
+    module_name = None
+    m_index = None
+    for i, part in enumerate(parts):
+        if part == "-m" and i + 1 < len(parts):
+            module_name = parts[i + 1]
+            m_index = i
+            break
+
+    if module_name is None or m_index is None:
+        return None
+
+    # The Python executable is the token immediately before -m.
+    # Skip env var assignments (KEY=VALUE) that precede it.
+    python_exe = None
+    if m_index > 0:
+        candidate = parts[m_index - 1]
+        # Env var assignments contain "=" — skip them
+        if "=" not in candidate:
+            python_exe = candidate
+
+    if python_exe is None:
+        # Fallback: scan backwards from -m for a token that looks like a path
+        # or "python"
+        for j in range(m_index - 1, -1, -1):
+            tok = parts[j]
+            if "=" in tok:
+                continue  # skip env vars
+            if "python" in tok or "/" in tok:
+                python_exe = tok
+                break
+
+    if python_exe is None:
+        return None
+
+    return (python_exe, module_name)
 
 
 def _run_import_sanity_check(
@@ -266,28 +361,25 @@ def _run_import_sanity_check(
     (e.g. ``python -m autoqa.run_eval`` → ``autoqa.run_eval``) and
     attempts to import it in the worktree.
 
-    Returns None if the check passes, or an error string if it fails.
+    Supports wrapped commands (``cd ... && ...``, ``PYTHONPATH=... python ...``).
+    If the command shape is not recognizable, the check is skipped gracefully.
+
+    Returns None if the check passes or is skipped, or an error string if
+    it fails.
     """
-    # Extract module name from "-m <module>" in eval_command
-    import shlex
+    parsed = _find_python_and_module(eval_command)
+    if parsed is None:
+        logger.debug(
+            "Pre-eval import check: could not parse eval_command — skipping. "
+            "cmd=%s", eval_command,
+        )
+        return None  # Can't determine module — skip check gracefully
 
-    try:
-        parts = shlex.split(eval_command)
-    except ValueError:
-        parts = eval_command.split()
-
-    module_name = None
-    for i, part in enumerate(parts):
-        if part == "-m" and i + 1 < len(parts):
-            module_name = parts[i + 1]
-            break
-
-    if module_name is None:
-        return None  # Can't determine module — skip check
+    python_exe, module_name = parsed
 
     # Try importing the module in the worktree
     check_cmd = (
-        f"PYTHONPATH=src:$PYTHONPATH {parts[0]} -c "
+        f"PYTHONPATH=src:$PYTHONPATH {python_exe} -c "
         f"'import {module_name}; print(\"import OK\")'"
     )
     result = worktree.run_eval_command(check_cmd, timeout=30)
@@ -1487,7 +1579,11 @@ def _run_single_hypothesis(
         # syntax checking or worktree application.  This is enforced at
         # the framework level because CodeAgent consistently ignores
         # prompt instructions not to touch these files.
+        #
+        # Hard-blocked files are dropped.  Warn-only files (e.g. __init__.py)
+        # are kept but logged so operators can diagnose eval failures.
         filtered_files: dict[str, str] = {}
+        blocked_count = 0
         for filename, content in agent_result.files.items():
             reason = _is_forbidden_file(filename)
             if reason is not None:
@@ -1495,11 +1591,17 @@ def _run_single_hypothesis(
                     "%s: BLOCKED %s from worktree apply — %s",
                     hyp_id, filename, reason,
                 )
+                blocked_count += 1
             else:
+                warn_reason = _is_warn_file(filename)
+                if warn_reason is not None:
+                    logger.warning(
+                        "%s: WARNING — applying %s (%s)",
+                        hyp_id, filename, warn_reason,
+                    )
                 filtered_files[filename] = content
 
-        if len(filtered_files) < len(agent_result.files):
-            blocked_count = len(agent_result.files) - len(filtered_files)
+        if blocked_count > 0:
             print(
                 f"[AHVS] {hyp_id}: blocked {blocked_count} forbidden file(s) "
                 f"from worktree apply (eval-harness protection)"

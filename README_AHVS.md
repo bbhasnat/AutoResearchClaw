@@ -424,17 +424,28 @@ Enriched fields (optional but strongly recommended — improves hypothesis quali
 
 Your `eval_command` is **executed in a git worktree** of the target repo after CodeAgent's generated files are applied. It must be reproducible and must write a numeric result that can be parsed.
 
-AHVS extracts metrics using a five-tier strategy (in priority order):
+AHVS extracts metrics using a two-path strategy depending on whether `eval_command` is configured:
+
+**When `eval_command` is configured (recommended):**
+
+| Tier | Source | Behavior |
+|---|---|---|
+| **0** | `eval_command` stdout (run in worktree) | **Only trusted source.** Metric parsed from stdout. |
+| — | Sandbox self-reports (result.json, best_metrics, best_stdout) | **Unconditionally skipped.** CodeAgent can fabricate metrics — only the real eval pipeline is trusted. |
+| — | `extraction_failed` | eval_command did not produce a valid metric |
+
+This is the authoritative-eval policy: when `eval_command` exists, it is the single source of truth. Sandbox self-reports are never used, regardless of whether eval succeeds or fails. This prevents false metrics (e.g. CodeAgent writing a fabricated `result.json` with `precision: 0.99` while the actual eval crashes).
+
+**When `eval_command` is empty or missing (legacy/sandbox-only mode):**
 
 | Tier | Source | When used |
 |---|---|---|
-| **0** | `eval_command` stdout (run in worktree) | eval_command configured and ran successfully |
 | 1 | `result.json` in work_dir or `agent_runs/*/` | Sandbox copy-back |
 | 2 | `CodeAgentResult.best_metrics` | Parsed from sandbox stdout |
 | 3 | `CodeAgentResult.best_stdout` | Raw `key: value` patterns |
 | 4 | `extraction_failed` | All tiers failed — hypothesis is treated as **failed** |
 
-When `eval_command` is empty or missing, Tier 0 is skipped — backward compatible with repos that don't have it. When `eval_command` fails (non-zero exit), AHVS logs a warning and falls through to the sandbox tiers.
+This mode is backward compatible with repos that don't have an `eval_command`.
 
 **Important:** A hypothesis with `measurement_status="extraction_failed"` is treated as an invalid experiment — it cannot count as "improved" even if the baseline value happens to produce `delta > 0`. If *all* hypotheses in a cycle fail measurement, Stage 8 marks the entire cycle as **FAILED** with an "INVALID CYCLE" recommendation.
 
@@ -731,13 +742,9 @@ Each `HypothesisResult` includes a `measurement_status` field that tracks whethe
 | `"sandbox_error"` | CodeAgent execution raised an exception before metric extraction |
 | `"not_executed"` | Hypothesis was not executed (default state) |
 
-**Five-tier metric extraction strategy** (in priority order):
+**Metric extraction policy** (see [Section 6.2](#62-eval-command) for full details):
 
-0. `eval_command` stdout from the hypothesis worktree (highest priority — real repo measurement)
-1. `result.json` in the hypothesis work directory (or `agent_runs/*/result.json` from sandbox copy-back)
-2. Structured metrics from `CodeAgentResult.best_metrics` (parsed from sandbox stdout)
-3. Raw `CodeAgentResult.best_stdout` parsed for `metric_name: value` patterns
-4. If all tiers fail, `measurement_status` is set to `"extraction_failed"` and a warning is logged
+When `eval_command` is configured, it is the **only trusted measurement source** — sandbox self-reports (result.json, CodeAgent stdout) are unconditionally skipped to prevent fabricated metrics. When `eval_command` is not configured, AHVS falls back to sandbox-based extraction (result.json → best_metrics → best_stdout). If no source produces a valid metric, `measurement_status` is set to `"extraction_failed"`.
 
 **Diagnosing `extraction_failed`:**
 - Check `tool_runs/<ID>/` for generated files — did CodeAgent produce code?

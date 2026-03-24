@@ -2569,10 +2569,15 @@ class TestForbiddenFiles:
         assert _is_forbidden_file("run_eval.py") is not None
         assert _is_forbidden_file("src/autoqa/run_eval.py") is not None
 
-    def test_init_py_blocked(self) -> None:
-        from researchclaw.ahvs.executor import _is_forbidden_file
-        assert _is_forbidden_file("__init__.py") is not None
-        assert _is_forbidden_file("src/autoqa/__init__.py") is not None
+    def test_init_py_is_warn_not_block(self) -> None:
+        """__init__.py is warn-only, not hard-blocked (v9 fix)."""
+        from researchclaw.ahvs.executor import _is_forbidden_file, _is_warn_file
+        # NOT hard-blocked
+        assert _is_forbidden_file("__init__.py") is None
+        assert _is_forbidden_file("src/autoqa/__init__.py") is None
+        # But IS a warning
+        assert _is_warn_file("__init__.py") is not None
+        assert _is_warn_file("src/autoqa/__init__.py") is not None
 
     def test_evaluation_py_blocked(self) -> None:
         from researchclaw.ahvs.executor import _is_forbidden_file
@@ -2596,10 +2601,11 @@ class TestForbiddenFiles:
         assert _is_forbidden_file("src/autoqa/llm_client.py") is None
 
     def test_forbidden_basenames_constant_complete(self) -> None:
-        """All known problematic files from production runs are in the list."""
-        from researchclaw.ahvs.executor import _FORBIDDEN_BASENAMES
-        for f in ("run_eval.py", "__init__.py", "evaluation.py", "main.py"):
+        """All known problematic files from production runs are blocked or warned."""
+        from researchclaw.ahvs.executor import _FORBIDDEN_BASENAMES, _WARN_BASENAMES
+        for f in ("run_eval.py", "evaluation.py", "main.py"):
             assert f in _FORBIDDEN_BASENAMES
+        assert "__init__.py" in _WARN_BASENAMES
 
 
 class TestPreEvalImportSanityCheck:
@@ -2889,3 +2895,153 @@ class TestBehavioralEvalModeIntelligence:
         idx = source.index("_NEEDS_REINFERENCE_TYPES")
         set_block = source[idx:idx + 100]
         assert '"code_change"' not in set_block
+
+
+# ---------------------------------------------------------------------------
+# 15. v9 review fixes — wrapped eval_command parsing, __init__.py warn-only
+# ---------------------------------------------------------------------------
+
+
+class TestFindPythonAndModule:
+    """v9 Fix 1: _find_python_and_module handles all documented eval_command shapes."""
+
+    def test_simple_python_m(self) -> None:
+        from researchclaw.ahvs.executor import _find_python_and_module
+        result = _find_python_and_module("python3 -m autoqa.run_eval --eval-only")
+        assert result == ("python3", "autoqa.run_eval")
+
+    def test_absolute_python_path(self) -> None:
+        from researchclaw.ahvs.executor import _find_python_and_module
+        result = _find_python_and_module(
+            "/home/ubuntu/miniconda3/envs/cohort_work/bin/python -m autoqa.run_eval"
+        )
+        assert result is not None
+        assert result[0] == "/home/ubuntu/miniconda3/envs/cohort_work/bin/python"
+        assert result[1] == "autoqa.run_eval"
+
+    def test_pythonpath_prefix(self) -> None:
+        from researchclaw.ahvs.executor import _find_python_and_module
+        result = _find_python_and_module(
+            "PYTHONPATH=src:$PYTHONPATH /usr/bin/python3 -m autoqa.run_eval --eval-only"
+        )
+        assert result is not None
+        assert result[0] == "/usr/bin/python3"
+        assert result[1] == "autoqa.run_eval"
+
+    def test_cd_and_python(self) -> None:
+        from researchclaw.ahvs.executor import _find_python_and_module
+        result = _find_python_and_module(
+            "cd /path/to/project && python -m package.run_eval --eval-only"
+        )
+        assert result is not None
+        assert result[0] == "python"
+        assert result[1] == "package.run_eval"
+
+    def test_multiple_env_vars(self) -> None:
+        from researchclaw.ahvs.executor import _find_python_and_module
+        result = _find_python_and_module(
+            "PYTHONPATH=src:$PYTHONPATH CUDA_VISIBLE_DEVICES=0 python3 -m my_pkg.eval"
+        )
+        assert result is not None
+        assert result[0] == "python3"
+        assert result[1] == "my_pkg.eval"
+
+    def test_no_m_flag_returns_none(self) -> None:
+        from researchclaw.ahvs.executor import _find_python_and_module
+        result = _find_python_and_module("bash run_eval.sh")
+        assert result is None
+
+    def test_cd_semicolon_python(self) -> None:
+        from researchclaw.ahvs.executor import _find_python_and_module
+        result = _find_python_and_module(
+            "cd /tmp; python3 -m mymod.entry"
+        )
+        assert result is not None
+        assert result[1] == "mymod.entry"
+
+    def test_real_eval_command_from_baseline(self) -> None:
+        """The actual eval_command from our production baseline_metric.json."""
+        from researchclaw.ahvs.executor import _find_python_and_module
+        cmd = (
+            "PYTHONPATH=src:$PYTHONPATH "
+            "/home/ubuntu/miniconda3/envs/cohort_work/bin/python "
+            "-m autoqa.run_eval --eval-only --reparse "
+            "--checkpoints-dir /home/ubuntu/vision/rnd_user_cohort/autoqa/checkpoints "
+            "--cohort-names pro_palestine elon_musk_fan"
+        )
+        result = _find_python_and_module(cmd)
+        assert result is not None
+        assert "python" in result[0]
+        assert result[1] == "autoqa.run_eval"
+
+
+class TestImportCheckWrappedCommands:
+    """v9 Fix 1: import sanity check works with wrapped eval_commands."""
+
+    def test_import_check_with_pythonpath_prefix(self, tmp_path: Path) -> None:
+        """Import check should work when eval_command has PYTHONPATH= prefix."""
+        from researchclaw.ahvs.executor import _run_import_sanity_check
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        # Create a valid module under src/
+        src = repo / "src" / "mypkg"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("")
+        (src / "run_eval.py").write_text("print('ok')\n")
+        subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add pkg"],
+            cwd=str(repo), capture_output=True, check=True,
+        )
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        result = _run_import_sanity_check(
+            wt,
+            "PYTHONPATH=src:$PYTHONPATH python3 -m mypkg.run_eval --eval-only"
+        )
+        assert result is None  # should pass
+        wt.cleanup()
+
+    def test_import_check_skips_non_python_command(self, tmp_path: Path) -> None:
+        """Non-Python eval_command (bash script) should be skipped gracefully."""
+        from researchclaw.ahvs.executor import _run_import_sanity_check
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        wt_path = tmp_path / "worktrees" / "H1"
+        wt = HypothesisWorktree(repo, wt_path)
+        wt.create()
+
+        result = _run_import_sanity_check(wt, "bash scripts/eval.sh --config test.yaml")
+        assert result is None  # should skip, not fail
+        wt.cleanup()
+
+
+class TestInitPyWarnOnly:
+    """v9 Fix 2: __init__.py is warn-only, not hard-blocked."""
+
+    def test_init_py_not_in_forbidden(self) -> None:
+        from researchclaw.ahvs.executor import _FORBIDDEN_BASENAMES
+        assert "__init__.py" not in _FORBIDDEN_BASENAMES
+
+    def test_init_py_in_warn(self) -> None:
+        from researchclaw.ahvs.executor import _WARN_BASENAMES
+        assert "__init__.py" in _WARN_BASENAMES
+
+    def test_is_warn_file_returns_reason(self) -> None:
+        from researchclaw.ahvs.executor import _is_warn_file
+        assert _is_warn_file("__init__.py") is not None
+        assert _is_warn_file("src/pkg/__init__.py") is not None
+
+    def test_is_warn_file_returns_none_for_normal(self) -> None:
+        from researchclaw.ahvs.executor import _is_warn_file
+        assert _is_warn_file("parsing.py") is None
+        assert _is_warn_file("main.py") is None  # main.py is forbidden, not warned
