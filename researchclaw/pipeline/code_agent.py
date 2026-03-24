@@ -75,6 +75,11 @@ class CodeAgentConfig:
     # Phase 5: Multi-agent review dialog
     review_max_rounds: int = 2
 
+    # AHVS mode: preserve directory paths in extracted filenames instead
+    # of flattening to basenames.  When True, "src/autoqa/parsing.py"
+    # stays as-is rather than becoming "parsing.py" → "main.py".
+    preserve_paths: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -1272,7 +1277,10 @@ class CodeAgent:
         # Local import to avoid circular dependency with executor.py
         from researchclaw.pipeline.executor import _extract_multi_file_blocks
 
-        return _extract_multi_file_blocks(content)
+        return _extract_multi_file_blocks(
+            content,
+            preserve_paths=self._cfg.preserve_paths,
+        )
 
     @staticmethod
     def _format_files(files: dict[str, str]) -> str:

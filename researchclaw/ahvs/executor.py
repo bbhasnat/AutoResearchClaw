@@ -1686,6 +1686,7 @@ def _run_single_hypothesis(
             exec_fix_max_iterations=2,
             tree_search_enabled=False,
             review_max_rounds=1,
+            preserve_paths=True,
         )
         sandbox_factory = _make_sandbox_factory(config)
 

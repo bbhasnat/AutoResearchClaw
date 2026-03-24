@@ -1093,7 +1093,11 @@ def _extract_code_block(content: str) -> str:
     return content.strip()
 
 
-def _extract_multi_file_blocks(content: str) -> dict[str, str]:
+def _extract_multi_file_blocks(
+    content: str,
+    *,
+    preserve_paths: bool = False,
+) -> dict[str, str]:
     """Parse LLM response containing multiple files with filename markers.
 
     Expected format::
@@ -1116,6 +1120,11 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
 
     Falls back to treating the entire code block as ``main.py`` if no
     ``filename:`` markers are found.
+
+    When *preserve_paths* is True (used by AHVS), directory components
+    are kept (e.g. ``src/autoqa/parsing.py`` stays as-is) and the
+    "promote first file to main.py" fallback is skipped.  This allows
+    the AHVS worktree pipeline to apply files to the correct repo paths.
 
     Returns a dict mapping filename → code content.
     """
@@ -1156,16 +1165,23 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
             # Security: prevent path traversal
             if ".." in fname or fname.startswith("/"):
                 continue
-            # Normalise to flat filenames (strip leading ./ or subdirs for safety)
-            fname = fname.replace("\\", "/").split("/")[-1]
+            # Normalise path separators
+            fname = fname.replace("\\", "/")
+            # Strip leading ./
+            if fname.startswith("./"):
+                fname = fname[2:]
+            if not preserve_paths:
+                # Legacy behaviour: flatten to basename for sandbox use
+                fname = fname.split("/")[-1]
             if fname and fname.endswith(".py"):
                 files[fname] = code.strip()
         if files:
-            # Ensure there is a main.py entry point
-            if "main.py" not in files:
-                # Pick the first file as main.py
-                first_key = next(iter(files))
-                files["main.py"] = files.pop(first_key)
+            if not preserve_paths:
+                # Ensure there is a main.py entry point (sandbox mode)
+                if "main.py" not in files:
+                    # Pick the first file as main.py
+                    first_key = next(iter(files))
+                    files["main.py"] = files.pop(first_key)
             return files
 
     # Fallback: single code block → main.py
