@@ -89,8 +89,8 @@ ARC's `PromptManager._load_overrides()` only updates stages already in `_DEFAULT
 
 AHVS supports two code agents for hypothesis execution:
 
-- **Claude Code** (default since `7baa452`): Runs as a CLI subprocess (`claude -p`) with read/edit/search tools scoped to the target repo. Edits files in-place with surgical precision, targeting the correct source paths. Use `--no-claude-code` to disable.
-- **Sandbox CodeAgent** (legacy): Runs in an `ExperimentSandbox`, generates files from scratch. Use `--use-claude-code` to explicitly opt in (now the default) or `--no-claude-code` to fall back to sandbox mode.
+- **Claude Code** (default since `7baa452`): Runs as a CLI subprocess (`claude -p`) with read/edit/search tools scoped to the target repo. Edits files in-place with surgical precision, targeting the correct source paths.
+- **Sandbox CodeAgent** (legacy): Runs in an `ExperimentSandbox`, generates files from scratch. Use `--use-sandbox-agent` to fall back to this mode.
 
 Both agents receive the same context:
 
