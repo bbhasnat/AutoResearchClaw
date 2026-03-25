@@ -10,8 +10,11 @@ workspaces/
 !.claude/agents/
 !.claude/agents/*.md
 !.claude/skills/
-!.claude/skills/**/SKILL.md
+!.claude/skills/**
 .claude/settings.local.json
+
+# Code reviews (local only)
+code_review/
 
 # Experiment run artifacts (local only)
 artifacts/

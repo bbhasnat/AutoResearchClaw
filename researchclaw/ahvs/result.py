@@ -75,8 +75,15 @@ class HypothesisResult:
 
 
 def save_results(results: list[HypothesisResult], path: Path) -> None:
+    """Save results, merging with any existing results (newer wins by hypothesis_id)."""
+    merged: dict[str, HypothesisResult] = {}
+    if path.exists():
+        for existing in load_results(path):
+            merged[existing.hypothesis_id] = existing
+    for r in results:
+        merged[r.hypothesis_id] = r
     path.write_text(
-        json.dumps([r.to_dict() for r in results], indent=2),
+        json.dumps([r.to_dict() for r in merged.values()], indent=2),
         encoding="utf-8",
     )
 

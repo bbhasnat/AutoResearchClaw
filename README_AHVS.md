@@ -314,7 +314,7 @@ The `ahvs_onboarding` skill will:
 5. Write an enriched `.ahvs/baseline_metric.json` with metrics, constraints, system levers, and prior experiments
 6. Verify the eval command produces parseable output
 
-It refuses to proceed until the setup is verified. See `skills/ahvs_onboarding/SKILL.md` for details.
+It refuses to proceed until the setup is verified. See `.claude/skills/ahvs_onboarding/SKILL.md` for details.
 
 **Option B: Manual setup**
 
@@ -826,17 +826,17 @@ researchclaw/ahvs/
 ├── executor.py              # 8 stage handlers + execute_ahvs_stage() dispatcher
 └── runner.py                # execute_ahvs_cycle() — outer orchestration loop
 
-skills/ahvs_onboarding/        # Claude Code onboarding skill
-├── SKILL.md                   # Conversational wizard: repo → .ahvs/baseline_metric.json
-└── references/                # Policy docs loaded as needed
-    ├── artifact_contract.md   # Baseline JSON schema
-    ├── eval_command_policy.md  # Eval command acceptance rules
-    └── git_mode_policy.md     # Git vs non-git trust model
+.claude/skills/ahvs_onboarding/    # Claude Code onboarding skill
+├── SKILL.md                       # Conversational wizard: repo → .ahvs/baseline_metric.json
+└── references/                    # Policy docs loaded as needed
+    ├── artifact_contract.md       # Baseline JSON schema
+    ├── eval_command_policy.md     # Eval command acceptance rules
+    └── git_mode_policy.md         # Git vs non-git trust model
 
-skills/ahvs_multiagent/        # Claude Code multi-agent execution skill
-├── SKILL.md                   # 5-phase flow: gen → GUI → team → loop → archive
+.claude/skills/ahvs_multiagent/    # Claude Code multi-agent execution skill
+├── SKILL.md                       # 5-phase flow: gen → GUI → team → loop → archive
 └── references/
-    ├── agent_prompts.md       # Executor + observer prompts with placeholders
+    ├── agent_prompts.md           # Executor + observer prompts with placeholders
     └── failure_classification.md  # FRAMEWORK_BUG / HYPOTHESIS_MISS / AMBIGUOUS rules
 ```
 
@@ -1044,7 +1044,7 @@ AHVS can be orchestrated by a multi-agent team using Claude Code's Agent Teams f
 
 The detailed implementation guide — including agent prompts, failure classification rules (FRAMEWORK_BUG / HYPOTHESIS_MISS / AMBIGUOUS), pytest gates, and Context7 skill usage — is in [`docs/agent_teams_guide.md`](docs/agent_teams_guide.md).
 
-**To trigger multi-agent execution conversationally**, use the `ahvs_multiagent` skill (see [`skills/ahvs_multiagent/SKILL.md`](skills/ahvs_multiagent/SKILL.md)):
+**To trigger multi-agent execution conversationally**, use the `ahvs_multiagent` skill (see [`.claude/skills/ahvs_multiagent/SKILL.md`](.claude/skills/ahvs_multiagent/SKILL.md)):
 
 ```
 Run AHVS on /path/to/my-project with multi-agent supervision. 3 hypotheses.

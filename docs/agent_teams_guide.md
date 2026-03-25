@@ -493,7 +493,7 @@ mcp__claude_ai_Context7__query-docs:
 
 ## Example: AHVS Team Lead / Executor / Observer
 
-This is the full multi-agent pattern for an AHVS cycle. For a skill that encodes this entire flow (so Claude Code follows it exactly without improvisation), see [`skills/ahvs_multiagent/SKILL.md`](../skills/ahvs_multiagent/SKILL.md).
+This is the full multi-agent pattern for an AHVS cycle. For a skill that encodes this entire flow (so Claude Code follows it exactly without improvisation), see [`.claude/skills/ahvs_multiagent/SKILL.md`](../.claude/skills/ahvs_multiagent/SKILL.md).
 
 ### Roles
 
