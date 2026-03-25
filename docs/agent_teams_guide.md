@@ -97,7 +97,7 @@ Agent:
 
     BEFORE STARTING:
     - Read /home/ubuntu/vision/AutoResearchClaw/CLAUDE.md
-    - Read all memory files in ~/.claude/projects/-home-ubuntu-vision-AutoResearchClaw/memory/
+    - Read all memory files in the target repo's .ahvs/memory/ directory
     - Confirm you are on branch avhs_man_llm and the working tree is clean
       (cd /home/ubuntu/vision/AutoResearchClaw && git status)
 
@@ -140,7 +140,7 @@ Agent:
 
     BEFORE STARTING:
     - Read /home/ubuntu/vision/AutoResearchClaw/CLAUDE.md — follow its memory discipline exactly
-    - Read all memory files in ~/.claude/projects/-home-ubuntu-vision-AutoResearchClaw/memory/
+    - Read all memory files in the target repo's .ahvs/memory/ directory
     - Read /home/ubuntu/vision/AutoResearchClaw/README_AHVS.md sections 1-3 for AHVS architecture
 
     YOUR RESPONSIBILITIES:
@@ -180,8 +180,8 @@ Agent:
     4. RECORD EVERY BUG IMMEDIATELY (do not defer to end of session):
        - Append to .ahvs/cycles/<cycle_id>/friction_log.md under ## Operator Notes
        - Append JSON line to .ahvs/evolution/lessons.jsonl
-       - Write a Claude memory file to ~/.claude/projects/-home-ubuntu-vision-AutoResearchClaw/memory/
-       - Update MEMORY.md index
+       - Write a memory file to the target repo's .ahvs/memory/ directory
+       - Update .ahvs/memory/INDEX.md
 
     5. NOTIFY AND COORDINATE:
        - SendMessage to lead: "FRAMEWORK_BUG fixed: <one-line description>. Tests pass.

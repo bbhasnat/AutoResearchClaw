@@ -275,9 +275,9 @@ Report to the user:
 
 This is critical — follows CLAUDE.md rules. As team lead, you must:
 
-- Write a memory file for every framework bug the observer fixes
-- Update MEMORY.md index after each memory write
-- Record lessons to `.ahvs/evolution/lessons.jsonl`
+- Write a memory file for every framework bug the observer fixes to `{REPO_PATH}/.ahvs/memory/`
+- Update `{REPO_PATH}/.ahvs/memory/INDEX.md` after each memory write
+- Record lessons to `{REPO_PATH}/.ahvs/evolution/lessons.jsonl`
 - Do NOT defer memory writes to end of session
 
 The observer also writes memory and lessons independently. The team lead should verify this happened by checking the files after the observer reports a fix.

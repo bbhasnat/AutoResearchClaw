@@ -276,8 +276,8 @@ end of session, not in batch, not "later."
    {"type": "framework_bug", "subcategory": "missing_guardrail", "description": "...", "fix": "...", "file": "...", "committed": true, "commit_hash": "...", "timestamp": "..."}
    ```
 
-3. **Claude memory**: `~/.claude/projects/-home-ubuntu-vision-AutoResearchClaw/memory/`
-   Write a new memory file with frontmatter and update MEMORY.md index.
+3. **AHVS memory**: `<target_repo>/.ahvs/memory/`
+   Write a new memory file and update `<target_repo>/.ahvs/memory/INDEX.md`.
 
 ### For HYPOTHESIS_MISS, write:
 

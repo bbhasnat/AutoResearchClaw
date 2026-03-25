@@ -1,6 +1,6 @@
 # AHVS — Adaptive Hypothesis Validation System
 
-AHVS is a cyclic hypothesis-validation pipeline built on top of ARC (AutoResearchClaw). It autonomously generates, selects, executes, and evaluates improvement hypotheses for any target LLM or RAG system — then archives what it learned for the next cycle.
+AHVS is a cyclic hypothesis-validation pipeline built on top of ARC (AutoResearchClaw). It autonomously generates, selects, executes, and evaluates improvement hypotheses for target LLM and RAG systems today, then archives what it learned for the next cycle. The roadmap is to extend the same loop to ML classifier repos and broader algorithmic/code-change workloads via a cleaner domain-adapter layer.
 
 ---
 
@@ -25,6 +25,7 @@ AHVS is a cyclic hypothesis-validation pipeline built on top of ARC (AutoResearc
     - [Execution Modes](#execution-modes)
     - [Prompt Engineering Tips](#prompt-engineering-tips)
     - [Multi-Agent Execution](#multi-agent-execution-with-claude-code-agent-teams)
+    - [Roadmap / TODOs](#roadmap--todos)
     - [Browser-Based Hypothesis Selector](#browser-based-hypothesis-selector)
     - [AST-Based Partial Output Merging](#ast-based-partial-output-merging-splice_functions)
     - [Framework Bug Fixes](#framework-bug-fixes)
@@ -84,9 +85,14 @@ AHVS and ARC are separate pipelines that **compose** — they share infrastructu
 
 ARC's `PromptManager._load_overrides()` only updates stages already in `_DEFAULT_STAGES` — new stage names are silently skipped. `AHVSPromptManager` (in `researchclaw/ahvs/prompts.py`) uses the same `RenderedPrompt` output type but allows any stage name, enabling YAML overrides for AHVS-specific prompts.
 
-### CodeAgent as the execution engine
+### Code agent: Claude Code (default) or sandbox CodeAgent
 
-AHVS does **not** call Promptfoo, DSPy, or Phoenix directly. Instead, it gives CodeAgent:
+AHVS supports two code agents for hypothesis execution:
+
+- **Claude Code** (default since `7baa452`): Runs as a CLI subprocess (`claude -p`) with read/edit/search tools scoped to the target repo. Edits files in-place with surgical precision, targeting the correct source paths. Use `--no-claude-code` to disable.
+- **Sandbox CodeAgent** (legacy): Runs in an `ExperimentSandbox`, generates files from scratch. Use `--use-claude-code` to explicitly opt in (now the default) or `--no-claude-code` to fall back to sandbox mode.
+
+Both agents receive the same context:
 
 - The hypothesis description and implementation plan
 - The available **skill library** (which tools exist and how to invoke them)
@@ -94,7 +100,7 @@ AHVS does **not** call Promptfoo, DSPy, or Phoenix directly. Instead, it gives C
 - Instructions that generated files will be applied to a git worktree (repo-relative paths)
 - The `eval_command` that will measure the result in the worktree
 
-CodeAgent decides which skill to use, generates all implementation code, and runs it in the sandbox. The generated files are then applied to a **detached git worktree** of the target repo (created at HEAD with `git worktree add --detach`), and the `eval_command` from `baseline_metric.json` is executed inside that worktree to produce a real measurement.
+Claude Code produces targeted edits to existing files (better for `code_change` hypotheses), while sandbox CodeAgent generates complete files (better for `architecture_change` hypotheses that create new modules). The generated files are then applied to a **detached git worktree** of the target repo (created at HEAD with `git worktree add --detach`), and the `eval_command` from `baseline_metric.json` is executed inside that worktree to produce a real measurement.
 
 ### Worktree execution model
 
@@ -102,7 +108,7 @@ Each hypothesis gets its own worktree under `<cycle_dir>/worktrees/<ID>/`. This 
 
 - **Repo-grounded execution:** Code is tested against the actual repo, not in an isolated sandbox
 - **No branch pollution:** Worktrees are detached (no branches created)
-- **Safe concurrency:** Each hypothesis has its own copy of the repo
+- **Safe concurrency:** Each hypothesis has its own copy of the repo (note: parallel execution is not yet supported — see [Parallel execution](#parallel-hypothesis-execution-future-work) for status)
 - **Path containment:** All CodeAgent-generated file paths are validated by a shared `validate_safe_relpath()` utility before writing — to both `tool_runs/` and worktree directories. Absolute paths, `..` traversal, and symlink escapes are rejected. The containment check uses `Path.is_relative_to()` (not string-prefix matching) to prevent false-positive bypasses
 - **Audit trail:** A `.patch` file is saved for every hypothesis
 - **Smart merging:** When CodeAgent produces partial file output (only some functions), AST-based `splice_functions` merges changes into the existing file rather than overwriting it — preserving untouched code, replacing modified definitions, and appending new ones
@@ -778,6 +784,7 @@ When `eval_command` is configured, it is the **only trusted measurement source**
 | Baseline metric | `<repo>/.ahvs/baseline_metric.json` |
 | EvolutionStore | `<repo>/.ahvs/evolution/` |
 | Cycle artifacts | `<repo>/.ahvs/cycles/<timestamp>/` |
+| Session memory | `<repo>/.ahvs/memory/` |
 
 ### Custom prompts override
 
@@ -833,12 +840,17 @@ skills/ahvs_multiagent/        # Claude Code multi-agent execution skill
     └── failure_classification.md  # FRAMEWORK_BUG / HYPOTHESIS_MISS / AMBIGUOUS rules
 ```
 
-### Per-cycle artifacts
+### Per-repo `.ahvs/` directory
 
 ```
 <repo>/.ahvs/
 ├── baseline_metric.json         # Required: baseline metric snapshot
 ├── evolution/                   # EvolutionStore: cumulative lessons across cycles
+├── memory/                     # Project-specific session memory (portable across machines)
+│   ├── INDEX.md                # One-line index of all memory files
+│   ├── session_20260319.md     # Session summaries: what ran, what broke, what was learned
+│   ├── bug_sandbox_fallback.md # Bug reports with root cause and fix details
+│   └── ...
 └── cycles/
     └── 20260318_120000/         # One directory per cycle run
         ├── ahvs_checkpoint.json      # Stage resumption checkpoint
@@ -861,6 +873,24 @@ skills/ahvs_multiagent/        # Claude Code multi-agent execution skill
             │   └── <generated files>
             └── H2/
 ```
+
+### Memory model
+
+AHVS uses a three-tier persistence model. All tiers write to the **target repo**, not to the AHVS framework repo or Claude's machine-local storage. This ensures memory is portable across machines and stays with the project it describes.
+
+| Tier | Location | Purpose | Written by |
+|---|---|---|---|
+| **Session memory** | `<repo>/.ahvs/memory/` | Human-readable session summaries, bug reports, and cross-session lessons | Team lead / observer agent |
+| **Friction log** | `<repo>/.ahvs/cycles/<id>/friction_log.md` | Per-cycle operator notes, errors, measurement issues | Executor (auto) + observer |
+| **Evolution lessons** | `<repo>/.ahvs/evolution/lessons.jsonl` | Machine-readable JSON lines fed into the next cycle's context loader (Stage 2) | Observer agent |
+
+**Session memory** (`<repo>/.ahvs/memory/`) contains:
+- Session records: what hypotheses ran, what improved, what bugs were found
+- Bug reports: root cause, fix details, files changed
+- Lessons that span multiple cycles (e.g., "prompt_rewrite hypotheses are unmeasurable with --eval-only")
+- An `INDEX.md` file indexing all memory files with one-line descriptions
+
+When AHVS agents start a cycle, they read `<repo>/.ahvs/memory/` to recall prior session context. When they find a bug or lesson, they write to it immediately — not at end of session.
 
 ---
 
@@ -1027,6 +1057,38 @@ The skill encodes the exact 5-phase flow so nothing is left to improvisation:
 3. **Per-hypothesis loop** — Executor runs one hypothesis at a time; Observer verifies and fixes any framework bugs before the next hypothesis runs
 4. **Archive** — Team Lead runs Stages 7–8, shuts down the team, and reports summary
 
+### Roadmap / TODOs
+
+AHVS already has a strong generic execution contract: repo + baseline metric + `eval_command` + isolated worktrees. That foundation should stay stable. The next work falls into two buckets: execution scalability and domain expansion.
+
+#### Execution scalability
+
+1. **Parallel hypothesis execution**
+   Hypotheses currently run sequentially. Parallel execution is feasible, but it needs two fixes first.
+2. **Run Claude Code inside per-hypothesis worktrees**
+   Two concurrent Claude Code processes should not edit the shared main repo. The clean fix is to create worktrees first and run each hypothesis agent inside its own worktree.
+3. **Add locking around `git worktree add/remove`**
+   Worktree operations are not atomic. Add a file lock such as `fcntl.flock` around create/remove operations to avoid metadata corruption.
+4. **Improve unattended throughput**
+   `save_results` already supports merge-by-ID accumulation, so batch and unattended execution should benefit once parallelism is in place. Multi-agent supervised mode benefits less because the observer verifies between hypotheses.
+
+#### Domain expansion
+
+1. **Formalize a real domain-adapter boundary**
+   Introduce a first-class adapter/plugin interface for domain-specific hypothesis generation hints, validation rules, success criteria, and optional tool checks. This replaces the current implicit coupling through prompt text and built-in hypothesis labels.
+2. **Split generic hypothesis types from domain-specific packs**
+   Keep core types such as `config_change`, `code_change`, and `architecture_change` in the base system, and move LLM-specific types such as `prompt_rewrite`, `model_comparison`, `dspy_optimize`, and `multi_llm_judge` into an LLM/RAG domain pack.
+3. **Add an ML text-classifier domain pack**
+   Provide classifier-oriented prompts, examples, and skills for common levers such as threshold calibration, class weighting, preprocessing/tokenization, sampling, loss changes, model-head changes, and training/inference pipeline improvements.
+4. **Generalize success criteria beyond single LLM-style metrics**
+   Preserve the current primary-metric contract, but improve first-class support for regression floors and multi-metric objectives such as `macro_f1`, precision/recall tradeoffs, calibration error, latency, and training cost.
+5. **Promote custom skills into domain-scoped libraries**
+   Make it easy to register reusable skill bundles for classifier training/eval, benchmark runners, ablation scripts, and algorithmic pipelines instead of assuming Promptfoo/DSPy-style tooling is the main path.
+6. **Broaden docs and onboarding examples**
+   Add end-to-end examples for non-RAG repos, especially text classification and general algorithmic optimization tasks, so users can onboard those targets without translating from answer-relevance/RAG examples.
+
+Near-term recommendation: treat AHVS as LLM/RAG-first in its built-in defaults, while evolving the adapter layer so repeated use on classifiers and other algorithmic repos becomes a clean extension rather than a prompt-level workaround.
+
 ### Browser-based hypothesis selector
 
 The `hypothesis_selector.py` module provides a standalone web GUI for hypothesis selection (no pip dependencies — pure stdlib):
@@ -1083,12 +1145,14 @@ The following framework bugs have been identified and fixed across recent sessio
 | **L** | Framework accepted CodeAgent self-reported metrics (false 0.9928) when eval crashed | v8 fix |
 | **M** | Stale worktree from first run blocked reruns | v8 fix |
 | **N** | CodeAgent consistently destroys eval harness files (run_eval.py, __init__.py, main.py) | v8 fix |
+| **O** | `save_results` overwrote `results.json` on each CLI invocation — multi-agent per-hypothesis runs lost prior results | `avhs_man_llm_v2` |
+| **P** | Root-level `.py` files from CodeAgent blocked instead of auto-remapped to `src/` counterpart | `14d360f` |
 
-All bugs have regression tests in `tests/test_ahvs.py` (190 tests total).
+All bugs have regression tests in `tests/test_ahvs.py` (211 tests total).
 
 ### Test coverage
 
-AHVS has 190 unit/integration tests in `tests/test_ahvs.py` covering:
+AHVS has 211 unit/integration tests in `tests/test_ahvs.py` covering:
 
 1. Stage enum ordering and contracts
 2. Config validation and edge cases
@@ -1108,7 +1172,9 @@ AHVS has 190 unit/integration tests in `tests/test_ahvs.py` covering:
 16. Bug K: worktree subdir hardening and full round-trip
 17. Bug L: forbidden file filter + hardened metric extraction
 18. Bug N: pre-eval import sanity check
-19. v8 fixes: tightened plan validation, falsy enriched context, behavioral tests
+19. Bug O: `save_results` merge-by-ID accumulation
+20. Bug P: root-level file auto-remap to `src/` counterpart
+21. v8 fixes: tightened plan validation, falsy enriched context, behavioral tests
 
 Run them with:
 ```bash

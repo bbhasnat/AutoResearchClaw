@@ -21,7 +21,7 @@ You are the executor agent for an AHVS multi-agent cycle.
 
 BEFORE STARTING:
 - Read {ARC_DIR}/CLAUDE.md
-- Read all memory files in ~/.claude/projects/-home-ubuntu-vision-AutoResearchClaw/memory/
+- Read all memory files in {REPO_PATH}/.ahvs/memory/
 - Confirm the branch and clean working tree:
     cd {ARC_DIR} && git status
 
@@ -77,7 +77,7 @@ guardrails), and ensure lessons are recorded.
 
 BEFORE STARTING:
 - Read {ARC_DIR}/CLAUDE.md — follow its memory discipline exactly
-- Read all memory files in ~/.claude/projects/-home-ubuntu-vision-AutoResearchClaw/memory/
+- Read all memory files in {REPO_PATH}/.ahvs/memory/
 - Read {ARC_DIR}/README_AHVS.md sections 1-3 for AHVS architecture context
 - Read {ARC_DIR}/.claude/skills/ahvs_multiagent/references/failure_classification.md
   for the full classification rules (this is your source of truth)
@@ -221,8 +221,8 @@ For AMBIGUOUS:
 RECORDING — do this IMMEDIATELY for every bug, not at end of session:
 - Append to .ahvs/cycles/<cycle_id>/friction_log.md under ## Operator Notes
 - Append JSON line to .ahvs/evolution/lessons.jsonl
-- Write a Claude memory file to ~/.claude/projects/-home-ubuntu-vision-AutoResearchClaw/memory/
-- Update MEMORY.md index
+- Write a memory file to {REPO_PATH}/.ahvs/memory/
+- Update {REPO_PATH}/.ahvs/memory/INDEX.md
 
 FOR HYPOTHESIS_MISS — record the lesson only:
 - Append to lessons.jsonl: what was tried, metric measured, result
